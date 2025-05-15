@@ -17,19 +17,11 @@ import warnings
 #Import customizable CNN
 from tools import mb2
 
-#For debugging
 torch.set_printoptions(threshold=5000)
-
-###############################################################################
-#
-# Code for the Sign Transformer network for SLR
-#
-###############################################################################
 
 #A helper function for producing N identical layers
 def clones(module, N):
     return nn.ModuleList([copy.deepcopy(module) for _ in range(N)])
-
 
 #Self-Attention mechanism
 def ScaledDotProductAttention(query, key, value, mask=None, dropout=None):
