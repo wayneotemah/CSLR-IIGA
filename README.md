@@ -32,6 +32,10 @@ place of the vanilla self-attention module.
 
 ![architecture](./images/architectures.png)
 
+<div align="center">
+  <img src="https://github.com/user-attachments/assets/ff61b8a0-a1b4-46ba-86d7-c9ce03826676" alt="intra-inter gloss attention" width="650"/>
+<div>
+
 ---
 
 1- First, download **PHOENIX-RWTH-WEATHER 2014** from [this link](https://www-i6.informatik.rwth-aachen.de/ftp/pub/rwth-phoenix/2016/phoenix-2014.v3.tar.gz). Then extract the comperessed file(.tar.gz).
