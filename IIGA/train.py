@@ -178,7 +178,7 @@ parser.add_argument('--freeze_cnn', default= False,
 parser.add_argument('--data_stats', type=str, default=None,
                     help="Normalize images using the dataset stats (mean/std).")
 
-parser.add_argument('--hand_stats', type=str, default='hand_stats.pt',
+parser.add_argument('--hand_stats', type=str, default=None,
                     help="Normalize images using the dataset stats (mean/std).")
 
 
@@ -460,8 +460,14 @@ train_path, valid_path, test_path = path_data(data_path=args.data, task='SLR', f
 if(args.data_stats):
     args.data_stats = torch.load(args.data_stats, map_location=torch.device('cpu'))
 
-if(args.hand_stats):
-    args.hand_stats = torch.load(args.hand_stats, map_location=torch.device('cpu'))
+if(args.hand_query and args.hand_stats):
+    if os.path.exists(args.hand_stats):
+        args.hand_stats = torch.load(args.hand_stats, map_location=torch.device('cpu'))
+    else:
+        print(f"WARNING: hand_stats file not found at {args.hand_stats}. Continuing without hand normalization.")
+        args.hand_stats = None
+else:
+    args.hand_stats = None
 
 #Pass the annotation + image sequences locations
 train_dataloader, train_size = loader(csv_file=train_path[1],

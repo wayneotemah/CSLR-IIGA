@@ -91,7 +91,7 @@ parser.add_argument('--hand_query', action='store_true',
 parser.add_argument('--data_stats', type=str, default='data_stats.pt',
                     help='Normalize images using the dataset stats (mean/std).')
 
-parser.add_argument('--hand_stats', type=str, default='hand_stats.pt',
+parser.add_argument('--hand_stats', type=str, default=None,
                     help='Normalize images using the dataset stats (mean/std).')
 
 parser.add_argument('--dp_keep_prob', type=float, default=0.7,
@@ -167,8 +167,14 @@ train_path, valid_path, test_path = path_data(data_path=args.data, task='SLR', h
 if(args.data_stats):
     args.data_stats = torch.load(args.data_stats, map_location=torch.device('cpu'))
 
-if(args.hand_stats):
-    args.hand_stats = torch.load(args.hand_stats, map_location=torch.device('cpu'))
+if(args.hand_query and args.hand_stats):
+    if os.path.exists(args.hand_stats):
+        args.hand_stats = torch.load(args.hand_stats, map_location=torch.device('cpu'))
+    else:
+        print(f"WARNING: hand_stats file not found at {args.hand_stats}. Continuing without hand normalization.")
+        args.hand_stats = None
+else:
+    args.hand_stats = None
 
 if (args.image_type == 'rgb'):
     channels = 3

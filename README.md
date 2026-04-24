@@ -158,6 +158,7 @@ Notes:
 - Segmentation masks are generated for train/dev/test (MediaPipe when available).
 - Lookup table is generated from train `gpt` targets.
 - When `--run_train` is used, checkpoints are saved to `<output_root>/trained_model` by default (override with `--save_dir` after `--`).
+- If you are not using `--hand_query`, do not pass `--hand_stats`; training now skips hand-stats loading by default.
 
 ### Prepare + launch training
 
