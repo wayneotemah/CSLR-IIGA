@@ -28,7 +28,7 @@ from tools.indexs_list import idxs
 import warnings
 warnings.filterwarnings("ignore")
 
-def collate_fn(data, fixed_padding=None, pad_index=1232):
+def collate_fn(data, fixed_padding=None, pad_index=0):
     """Creates mini-batch tensors w/ same length sequences by performing padding to the sequecenses.
     We should build a custom collate_fn to merge sequences w/ padding (not supported in default).
     Seqeuences are padded to the maximum length of mini-batch sequences (dynamic padding), else pad
@@ -120,6 +120,9 @@ class PhoenixDataset(Dataset):
         #Retrieve lookup table dic from path
         with open(lookup_table, 'rb') as pickle_file:
             self.lookup_table = pickle.load(pickle_file)
+
+        # Align unknown token index with provided lookup table when possible
+        self.unk_index = self.lookup_table.get('<UNK>', self.unk_index)
 
 
     def __len__(self):
