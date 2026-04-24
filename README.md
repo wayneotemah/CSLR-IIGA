@@ -157,6 +157,7 @@ Notes:
 - Frames are extracted and written in PHOENIX-compatible layout.
 - Segmentation masks are generated for train/dev/test (MediaPipe when available).
 - Lookup table is generated from train `gpt` targets.
+- When `--run_train` is used, checkpoints are saved to `<output_root>/trained_model` by default (override with `--save_dir` after `--`).
 
 ### Prepare + launch training
 

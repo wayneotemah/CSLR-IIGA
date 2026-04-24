@@ -200,7 +200,8 @@ args = parser.parse_args()
 torch.manual_seed(args.seed)
 
 #experiment_path = PureWindowsPath('EXPERIMENTATIONS\\' + start_date)
-experiment_path = os.path.join('/home/CSLR_IIGA/trained_model',start_date)
+base_save_dir = args.save_dir if args.save_dir else 'EXPERIMENTATIONS'
+experiment_path = os.path.join(base_save_dir, start_date)
 
 # Creates an experimental directory and dumps all the args to a text file
 if(os.path.exists(experiment_path)):
@@ -209,9 +210,9 @@ if(os.path.exists(experiment_path)):
 else:
     os.makedirs(experiment_path)
 
-print ("\nPutting log in EXPERIMENTATIONS/%s"%start_date)
+print ("\nPutting log in %s"%experiment_path)
 
-args.save_dir = os.path.join(args.save_dir, start_date)
+args.save_dir = experiment_path
 
 #Dump all configurations/hyperparameters in txt
 with open (os.path.join(experiment_path,'exp_config.txt'), 'w') as f:

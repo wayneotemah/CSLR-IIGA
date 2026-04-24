@@ -211,6 +211,11 @@ def run_training(train_script, prepared_root, lookup_path, train_seg_root, val_s
         '--train_segment_root', str(train_seg_root),
         '--val_segment_root', str(val_seg_root),
     ]
+
+    # Ensure train.py writes checkpoints in a writable location unless user overrides it.
+    if '--save_dir' not in extra_args:
+        cmd.extend(['--save_dir', str(Path(prepared_root) / 'trained_model')])
+
     cmd.extend(extra_args)
 
     print('\nRunning training command:')
