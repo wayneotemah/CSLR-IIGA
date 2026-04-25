@@ -116,3 +116,92 @@ python -u prediction.py --data ./CSLR-IIGA/phoenix2014-release/phoenix-2014-mult
 
  
 
+
+
+## Install dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+## Train from JSON + Video directly
+
+You can now prepare and train from JSON files that look like:
+
+```json
+{
+  "id": "my_sample_0001",
+  "video": "/clips/my_sample_0001.mp4",
+  "conversations": [
+    {"from": "human", "value": "<video>\n..."},
+    {"from": "gpt", "value": "GLOSS TOKENS HERE"}
+  ]
+}
+```
+
+Only `from == "gpt"` is used as the target sequence. Human turns are ignored.
+
+### One-command data preparation
+
+```bash
+python IIGA/train_from_json.py \
+  --train_json /path/to/train.json \
+  --eval_json /path/to/eval.json \
+  --test_json /path/to/test.json \
+  --video_root /path/to/videos_root \
+  --output_root /path/to/prepared_dataset
+```
+
+Notes:
+- If `video` in JSON starts with `/`, the script appends it to `--video_root` (root-prefixed absolute style).
+- Frames are extracted and written in PHOENIX-compatible layout.
+- Segmentation masks are generated for train/dev/test (MediaPipe when available).
+- Lookup table is generated from train `gpt` targets.
+- When `--run_train` is used, checkpoints are saved to `<output_root>/trained_model` by default (override with `--save_dir` after `--`).
+- If you are not using `--hand_query`, do not pass `--hand_stats`; training now skips hand-stats loading by default.
+
+### Prepare + launch training
+
+```bash
+python IIGA/train_from_json.py \
+  --train_json /path/to/train.json \
+  --eval_json /path/to/eval.json \
+  --test_json /path/to/test.json \
+  --video_root /path/to/videos_root \
+  --output_root /path/to/prepared_dataset \
+  --run_train -- \
+  --batch_size 2 --num_workers 4 --dp_keep_prob 0.9
+```
+
+The generated dataset layout is:
+
+```text
+<output_root>/
+  features/fullFrame-210x260px/{train,dev,test}/<id>/1/images000-0.png
+  annotations/manual/{train,dev,test}.corpus.csv
+  segmentation/{train_segmentation,val_segmentation,test_segmentation}/<id>/*.npy.gz
+  lookup/json_lookup.pkl
+```
+
+
+### Preview GT vs prediction examples (from BEST.pt or any checkpoint)
+
+```bash
+python IIGA/preview_predictions.py \
+  --data /path/to/prepared_dataset \
+  --segment_root /path/to/prepared_dataset/segmentation/val_segmentation \
+  --lookup_table /path/to/prepared_dataset/lookup/json_lookup.pkl \
+  --model_path /path/to/BEST.pt \
+  --split valid \
+  --num_examples 10
+```
+
+This prints examples like:
+
+```text
+GT: THANK YOU
+PRED: [blank]
+
+GT: GOOD MORNING
+PRED: YOU YOU YOU
+```
