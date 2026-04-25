@@ -178,7 +178,7 @@ parser.add_argument('--freeze_cnn', default= False,
 parser.add_argument('--data_stats', type=str, default=None,
                     help="Normalize images using the dataset stats (mean/std).")
 
-parser.add_argument('--hand_stats', type=str, default='hand_stats.pt',
+parser.add_argument('--hand_stats', type=str, default=None,
                     help="Normalize images using the dataset stats (mean/std).")
 
 
@@ -200,7 +200,8 @@ args = parser.parse_args()
 torch.manual_seed(args.seed)
 
 #experiment_path = PureWindowsPath('EXPERIMENTATIONS\\' + start_date)
-experiment_path = os.path.join('/home/CSLR_IIGA/trained_model',start_date)
+base_save_dir = args.save_dir if args.save_dir else 'EXPERIMENTATIONS'
+experiment_path = os.path.join(base_save_dir, start_date)
 
 # Creates an experimental directory and dumps all the args to a text file
 if(os.path.exists(experiment_path)):
@@ -209,9 +210,9 @@ if(os.path.exists(experiment_path)):
 else:
     os.makedirs(experiment_path)
 
-print ("\nPutting log in EXPERIMENTATIONS/%s"%start_date)
+print ("\nPutting log in %s"%experiment_path)
 
-args.save_dir = os.path.join(args.save_dir, start_date)
+args.save_dir = experiment_path
 
 #Dump all configurations/hyperparameters in txt
 with open (os.path.join(experiment_path,'exp_config.txt'), 'w') as f:
@@ -459,8 +460,14 @@ train_path, valid_path, test_path = path_data(data_path=args.data, task='SLR', f
 if(args.data_stats):
     args.data_stats = torch.load(args.data_stats, map_location=torch.device('cpu'))
 
-if(args.hand_stats):
-    args.hand_stats = torch.load(args.hand_stats, map_location=torch.device('cpu'))
+if(args.hand_query and args.hand_stats):
+    if os.path.exists(args.hand_stats):
+        args.hand_stats = torch.load(args.hand_stats, map_location=torch.device('cpu'))
+    else:
+        print(f"WARNING: hand_stats file not found at {args.hand_stats}. Continuing without hand normalization.")
+        args.hand_stats = None
+else:
+    args.hand_stats = None
 
 #Pass the annotation + image sequences locations
 train_dataloader, train_size = loader(csv_file=train_path[1],

@@ -1,0 +1,14 @@
+numpy
+pandas
+matplotlib
+opencv-python
+scikit-image
+torch
+torchvision
+tensorflow
+jiwer
+progressbar2
+GPUtil
+torchsummary
+mediapipe
+tqdm
