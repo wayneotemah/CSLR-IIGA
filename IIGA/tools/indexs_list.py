@@ -7,6 +7,13 @@ def idxs(video_length,random_drop,uniform_drop):
     if uniform_drop:
         num_frame = round(video_length * uniform_drop)
 
+        # Guard edge cases where rounding results in 0 or all frames.
+        # - num_frame == 0 would cause division by zero in sampling logic.
+        # - num_frame >= video_length should return the full sequence.
+        num_frame = max(1, min(num_frame, video_length))
+        if num_frame == video_length:
+            return list(range(video_length))
+
         if video_length//num_frame==1:
             num_delete_idxs=video_length-num_frame
             d=video_length//(num_delete_idxs)
