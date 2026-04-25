@@ -182,3 +182,26 @@ The generated dataset layout is:
   segmentation/{train_segmentation,val_segmentation,test_segmentation}/<id>/*.npy.gz
   lookup/json_lookup.pkl
 ```
+
+
+### Preview GT vs prediction examples (from BEST.pt or any checkpoint)
+
+```bash
+python IIGA/preview_predictions.py \
+  --data /path/to/prepared_dataset \
+  --segment_root /path/to/prepared_dataset/segmentation/val_segmentation \
+  --lookup_table /path/to/prepared_dataset/lookup/json_lookup.pkl \
+  --model_path /path/to/BEST.pt \
+  --split valid \
+  --num_examples 10
+```
+
+This prints examples like:
+
+```text
+GT: THANK YOU
+PRED: [blank]
+
+GT: GOOD MORNING
+PRED: YOU YOU YOU
+```
