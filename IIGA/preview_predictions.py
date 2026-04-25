@@ -3,7 +3,7 @@ import _pickle as pickle
 import torch
 
 from dataloader import loader
-from tools.utils import path_data
+from tools.utils import path_data, Batch
 from transformer import make_model as TRANSFORMER
 
 
@@ -78,6 +78,8 @@ if __name__ == '__main__':
     parser.add_argument('--emb_network', type=str, default='mb2')
     parser.add_argument('--hand_query', action='store_true')
     parser.add_argument('--image_type', type=str, default='rgb', choices=['rgb', 'grayscale'])
+    parser.add_argument('--local_window', type=int, default=10)
+    parser.add_argument('--fixed_padding', type=int, default=None)
 
     args = parser.parse_args()
 
@@ -120,6 +122,7 @@ if __name__ == '__main__':
         n_units=args.hidden_size,
         n_heads=args.n_heads,
         d_ff=args.d_ff,
+        window_size=args.local_window,
         dropout=1. - args.dp_keep_prob,
         image_size=args.rescale,
         emb_type=args.emb_type,
@@ -135,7 +138,30 @@ if __name__ == '__main__':
             x = x.to(device)
             hand_regions = hand_regions.to(device) if (args.hand_query and hand_regions is not None) else None
 
-            output, _, _ = model.forward(x, None, None, hand_regions)
+            batch = Batch(
+                x_lengths,
+                y_lengths,
+                None,
+                trg=None,
+                emb_type=args.emb_type,
+                DEVICE=device,
+                fixed_padding=args.fixed_padding,
+                rel_window=None,
+            )
+
+            output, output_context, output_hand = model.forward(
+                x,
+                batch.src_mask,
+                batch.rel_mask,
+                hand_regions
+            )
+            
+            if output is None:
+                output = output_context
+            
+            if output is None:
+                raise RuntimeError("Model returned both output and output_context as None.")
+            
             # output: (batch, seq_len, vocab)
             pred_frame_ids = torch.argmax(output, dim=-1).cpu().numpy()
 

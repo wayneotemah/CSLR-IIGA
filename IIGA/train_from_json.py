@@ -254,8 +254,8 @@ if __name__ == '__main__':
     segmenter = build_segmenter(use_segmentation=not args.disable_segmentation)
 
     train_rows, train_targets = process_split(train_records, 'train', output_root, train_seg_root, args.frame_stride, segmenter, args.video_root)
-    eval_rows, _ = process_split(eval_records, 'dev', output_root, val_seg_root, args.frame_stride, segmenter, args.video_root)
-    test_rows, _ = process_split(test_records, 'test', output_root, test_seg_root, args.frame_stride, segmenter, args.video_root)
+    eval_rows, eval_targets = process_split(eval_records, 'dev', output_root, val_seg_root, args.frame_stride, segmenter, args.video_root)
+    test_rows, test_targets = process_split(test_records, 'test', output_root, test_seg_root, args.frame_stride, segmenter, args.video_root)
 
     annotations_dir = output_root / 'annotations' / 'manual'
     write_corpus_csv(annotations_dir / 'train.corpus.csv', train_rows)
@@ -263,7 +263,8 @@ if __name__ == '__main__':
     write_corpus_csv(annotations_dir / 'test.corpus.csv', test_rows)
 
     lookup_out = Path(args.lookup_out) if args.lookup_out else (output_root / 'lookup' / 'json_lookup.pkl')
-    vocab = build_lookup(train_targets, lookup_out)
+    all_targets = train_targets + eval_targets + test_targets
+    vocab = build_lookup(all_targets, lookup_out)
 
     if segmenter not in (None, 'fallback_ones'):
         segmenter.close()
