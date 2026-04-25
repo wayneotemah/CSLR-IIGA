@@ -1,7 +1,5 @@
 import argparse
 import _pickle as pickle
-import os
-
 import torch
 
 from dataloader import loader
@@ -45,7 +43,14 @@ def pick_split_paths(data_root, split, hand_query=False):
 
 
 def load_checkpoint(model, model_path, device):
-    ckpt = torch.load(model_path, map_location=device)
+    # PyTorch >=2.6 defaults to weights_only=True; training checkpoints in this repo
+    # include non-tensor objects (optimizer, loss, etc.), so we need weights_only=False.
+    try:
+        ckpt = torch.load(model_path, map_location=device, weights_only=False)
+    except TypeError:
+        # Backward compatibility for older PyTorch versions without weights_only arg.
+        ckpt = torch.load(model_path, map_location=device)
+
     if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
         model.load_state_dict(ckpt['model_state_dict'])
     else:
