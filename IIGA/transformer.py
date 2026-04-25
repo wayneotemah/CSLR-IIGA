@@ -633,7 +633,8 @@ class HandExtractor(nn.Module):
         modules = list(self.network.children())[:-1]
         self.network = nn.Sequential(*modules)
 
-        self.n_units= n_units
+        self.n_units = n_units
+        self.embedding_proj = nn.Identity() if self.n_units == 1280 else nn.Linear(1280, self.n_units)
 
     #Input (batch, hands, seq, 3, 64, 64)
     #Input 1 hand (batch, seq, 3, 64, 64)
@@ -645,10 +646,12 @@ class HandExtractor(nn.Module):
 
         #Apply AVG POOL if we have a feature map
         if(len(emb.shape) > 2):
-            emb =  emb.mean(3).mean(2)
+            emb = emb.mean(3).mean(2)
+
+        emb = self.embedding_proj(emb)
 
         #Reshape embeddings as expected from transformer block
-        emb = emb.view(batch, -1, self.n_units)
+        emb = emb.view(batch, seq, self.n_units)
 
         return emb
 
@@ -664,6 +667,7 @@ class src_2Dembeddings(nn.Module):
 
         self.n_units = n_units
         self.network_type = network_type
+        self.cnn_output_units = None
 
         self.position = PositionalEncoding(n_units, 0.3)
 
@@ -672,27 +676,35 @@ class src_2Dembeddings(nn.Module):
         if(self.network_type=='mb2'):
             #self.network = torchvision.models.mobilenet_v2(pretrained=pretrained)
             self.network = mb2.mobilenet_v2(channels=channels, pretrained=pretrained)
+            self.cnn_output_units = 1280
 
         elif (self.network_type=='alexnet'):
             self.network = torchvision.models.alexnet(pretrained=pretrained)
+            self.cnn_output_units = 256
 
         elif (self.network_type=='resnet'):
             self.network = torchvision.models.resnet18(pretrained=pretrained)
+            self.cnn_output_units = 512
 
         elif (self.network_type=='resnet50'):
             self.network = torchvision.models.resnet50(pretrained=pretrained)
+            self.cnn_output_units = 2048
 
         elif (self.network_type=='efficientnet_b7'):
             self.network = torchvision.models.efficientnet_b7(pretrained=pretrained)
+            self.cnn_output_units = 2560
 
         elif (self.network_type=='vgg11'):
             self.network = torchvision.models.vgg11(pretrained=pretrained)
+            self.cnn_output_units = 512
 
         elif (self.network_type=='resnext'):
             self.network = torchvision.models.resnext50_32x4d(pretrained=pretrained)
+            self.cnn_output_units = 2048
 
         elif(self.network_type=='wide_resnet'):
             self.network = torchvision.models.wide_resnet50_2(pretrained=pretrained)
+            self.cnn_output_units = 2048
 
         else:
             print('No supported architecture!!')
@@ -701,6 +713,10 @@ class src_2Dembeddings(nn.Module):
         #Drop FC layer
         modules = list(self.network.children())[:-1]
         self.network = nn.Sequential(*modules)
+        self.embedding_proj = (
+            nn.Identity() if self.n_units == self.cnn_output_units
+            else nn.Linear(self.cnn_output_units, self.n_units)
+        )
 
         #Placeholder for gradients
         self.gradients = None
@@ -729,10 +745,14 @@ class src_2Dembeddings(nn.Module):
 
         #Apply AVG POOL if we have a feature map
         if(len(feature_map.shape) > 2):
-            frame_embeddings =  feature_map.mean(3).mean(2)
+            frame_embeddings = feature_map.mean(3).mean(2)
+        else:
+            frame_embeddings = feature_map
+
+        frame_embeddings = self.embedding_proj(frame_embeddings)
 
         #Reshape embeddings as expected from transformer block
-        frame_embeddings = frame_embeddings.view(batch_size, -1, self.n_units)
+        frame_embeddings = frame_embeddings.view(batch_size, seq_len, self.n_units)
 
         #image emb = (batch, seq_length, n_units)
         return frame_embeddings, feature_map, self.gradients
@@ -1073,6 +1093,5 @@ class PositionWise(nn.Module):
     def forward(self, x):
         return self.w_2(self.dropout(F.relu(self.w_1(x))))
         #return self.w_2(self.dropout(self.activation(self.w_1(x))))
-
 
 

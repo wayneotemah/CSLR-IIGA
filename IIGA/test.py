@@ -28,6 +28,24 @@ from jiwer import wer
 import tensorflow.compat.v1 as tf
 tf.enable_eager_execution()
 
+# parser helper for optional probabilities in [0, 1]
+def optional_probability(value):
+    if value is None:
+        return None
+
+    if isinstance(value, str) and value.lower() in {'none', 'null'}:
+        return None
+
+    try:
+        prob = float(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError("value must be a float in [0, 1] or 'none'.")
+
+    if prob < 0.0 or prob > 1.0:
+        raise argparse.ArgumentTypeError("value must be between 0 and 1.")
+
+    return prob
+
 
 ###
 # Arg parsing
@@ -48,10 +66,10 @@ parser.add_argument('--val_segment_root',type=str)
 
 parser.add_argument('--local_window', type=int, default=10)
 
-parser.add_argument('--random_drop_probability', type=float, default=None,
+parser.add_argument('--random_drop_probability', type=optional_probability, default=None,
                     help='probability of frame random drop/0-1 or None')
 
-parser.add_argument('--uniform_drop_probability', type=float, default=0.5,
+parser.add_argument('--uniform_drop_probability', type=optional_probability, default=0.5,
                     help='probability of frame random drop/0-1 or None')
 
 parser.add_argument('--lookup_table', type=str, default=os.path.join('data','slr_lookup.txt'),

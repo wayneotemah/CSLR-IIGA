@@ -3,8 +3,12 @@ import math
 import random
 
 def idxs(video_length,random_drop,uniform_drop):
+    if video_length <= 0:
+        return []
 
-    if uniform_drop:
+    if uniform_drop is not None:
+        if uniform_drop <= 0:
+            return list(range(video_length))
         num_frame = round(video_length * uniform_drop)
 
         # Guard edge cases where rounding results in 0 or all frames.
@@ -49,9 +53,13 @@ def idxs(video_length,random_drop,uniform_drop):
 
 
     else:
+        if random_drop is None or random_drop <= 0:
+            return list(range(video_length))
 
         all_idxs = range(0 , video_length)
-        selected_idxs = random.sample(all_idxs , k = round(random_drop * video_length))
+        num_frame = round(random_drop * video_length)
+        num_frame = max(1, min(num_frame, video_length))
+        selected_idxs = random.sample(all_idxs , k = num_frame)
         selected_idxs.sort()
 
 

@@ -143,7 +143,7 @@ class PhoenixDataset(Dataset):
                 indexs = idxs(len(files),random_drop=self.random_drop,uniform_drop=self.uniform_drop)
                 seq_length = len(indexs)
             else:
-                if self.random_drop:
+                if self.random_drop is not None:
                     indexs = idxs(len(files),random_drop=None,uniform_drop= self.random_drop)
                 else:
                     indexs = idxs(len(files),random_drop=None,uniform_drop= self.uniform_drop)
