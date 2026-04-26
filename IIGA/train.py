@@ -160,6 +160,9 @@ parser.add_argument('--save_steps', type=int, default=10, help='Save model after
 
 parser.add_argument('--debug', action='store_true')
 
+parser.add_argument('--no_augment', action='store_true',
+                    help='Disable training augmentations for overfit/debug runs.')
+
 parser.add_argument('--save_dir', type=str, default='EXPERIMENTATIONS',
                     help='path to save the experimental config, logs, model')
 
@@ -368,7 +371,7 @@ def run_epoch(model, data, is_train=False, device='cuda:0', n_devices=1):
 
             #Return tuple of sentences and probs
             decodes, _ = tf.nn.ctc_beam_search_decoder(inputs=output.cpu().detach().numpy(),
-                                 sequence_length=x_lengths.cpu().detach().numpy(), merge_repeated=False, beam_width=10, top_paths=1)
+                                 sequence_length=x_lengths.cpu().detach().numpy(), merge_repeated=True, beam_width=10, top_paths=1)
             #Get top 1 path
             #(batch, Seq)
             pred = decodes[0]
@@ -498,7 +501,7 @@ train_dataloader, train_size = loader(csv_file=train_path[1],
                 random_drop= args.random_drop_probability,
                 uniform_drop= args.uniform_drop_probability,
                 show_sample = args.show_sample,
-                istrain=True,
+                istrain=not args.no_augment,
                 fixed_padding=args.fixed_padding,
                 hand_dir=train_path[2],
                 data_stats=args.data_stats,
