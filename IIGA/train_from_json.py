@@ -5,6 +5,7 @@ import json
 import os
 import pickle
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -62,10 +63,10 @@ def get_gpt_target(record):
 
 
 def extract_frames(video_path, out_frame_dir, frame_stride=1):
-    if cv2 is None:
-        raise ImportError('opencv-python is required. Install dependencies with: pip install -r requirements.txt')
-
     out_frame_dir.mkdir(parents=True, exist_ok=True)
+
+    if cv2 is None:
+        return extract_frames_with_ffmpeg(video_path, out_frame_dir, frame_stride=frame_stride)
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -88,6 +89,36 @@ def extract_frames(video_path, out_frame_dir, frame_stride=1):
 
     cap.release()
 
+    if written == 0:
+        raise RuntimeError(f'No frames extracted from {video_path}')
+
+    return written
+
+
+def extract_frames_with_ffmpeg(video_path, out_frame_dir, frame_stride=1):
+    ffmpeg = shutil.which('ffmpeg')
+    if ffmpeg is None:
+        raise ImportError('opencv-python is required unless ffmpeg is available on PATH')
+
+    frame_stride = max(int(frame_stride), 1)
+    pattern = out_frame_dir / 'images%03d-0.png'
+    vf = f"select='not(mod(n\\,{frame_stride}))',scale=224:224"
+    cmd = [
+        ffmpeg,
+        '-hide_banner',
+        '-loglevel',
+        'error',
+        '-i',
+        str(video_path),
+        '-vf',
+        vf,
+        '-vsync',
+        '0',
+        str(pattern),
+    ]
+    subprocess.run(cmd, check=True)
+
+    written = len(list(out_frame_dir.glob('images*-0.png')))
     if written == 0:
         raise RuntimeError(f'No frames extracted from {video_path}')
 
@@ -117,19 +148,24 @@ def build_segmenter(use_segmentation):
 
 
 def write_segmentation(frame_dir, seg_dir, segmenter):
-    if cv2 is None:
-        raise ImportError('opencv-python is required. Install dependencies with: pip install -r requirements.txt')
-
     seg_dir.mkdir(parents=True, exist_ok=True)
     frame_files = sorted([p for p in frame_dir.iterdir() if p.suffix.lower() in {'.png', '.jpg', '.jpeg'}])
 
     for frame_file in frame_files:
+        if segmenter is None:
+            seg = np.ones((224, 224), dtype=np.uint8)
+            out_name = seg_dir / f'{frame_file.stem}.npy.gz'
+            with gzip.GzipFile(out_name, 'wb') as f:
+                np.save(file=f, arr=seg)
+            continue
+
+        if cv2 is None:
+            raise ImportError('opencv-python is required for MediaPipe segmentation')
+
         image = cv2.imread(str(frame_file))
         image = cv2.resize(image, (224, 224))
 
-        if segmenter is None:
-            seg = np.ones((224, 224), dtype=np.uint8)
-        elif segmenter == 'fallback_ones':
+        if segmenter == 'fallback_ones':
             seg = np.ones((224, 224), dtype=np.uint8)
         else:
             result = segmenter.process(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
@@ -147,7 +183,6 @@ def write_corpus_csv(csv_path, rows):
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     with open(csv_path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
-        writer.writerow(['annotation'])
         for row in rows:
             writer.writerow([row])
 
@@ -263,8 +298,7 @@ if __name__ == '__main__':
     write_corpus_csv(annotations_dir / 'test.corpus.csv', test_rows)
 
     lookup_out = Path(args.lookup_out) if args.lookup_out else (output_root / 'lookup' / 'json_lookup.pkl')
-    all_targets = train_targets + eval_targets + test_targets
-    vocab = build_lookup(all_targets, lookup_out)
+    vocab = build_lookup(train_targets, lookup_out)
 
     if segmenter not in (None, 'fallback_ones'):
         segmenter.close()

@@ -12,10 +12,14 @@ import pandas as pd
 import numpy as np
 import _pickle as pickle
 import matplotlib.pyplot as plt
-import cv2
+try:
+    import cv2
+except ImportError:
+    cv2 = None
 import random
 from skimage import io
 import gzip
+from PIL import Image
 
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms, utils
@@ -28,7 +32,29 @@ from tools.indexs_list import idxs
 import warnings
 warnings.filterwarnings("ignore")
 
-def collate_fn(data, fixed_padding=None, pad_index=0):
+
+def read_frame_image(path):
+    if cv2 is not None:
+        image = cv2.imread(path)
+        if image is None:
+            raise FileNotFoundError(path)
+        return image
+
+    image = io.imread(path)
+    if image.ndim == 2:
+        image = np.repeat(image[..., np.newaxis], 3, axis=2)
+    elif image.shape[2] > 3:
+        image = image[:, :, :3]
+    return image.astype(np.uint8)
+
+
+def resize_frame_image(image, size):
+    if cv2 is not None:
+        return cv2.resize(image, size)
+
+    return np.asarray(Image.fromarray(image).resize(size, Image.BILINEAR))
+
+def collate_fn(data, fixed_padding=None, pad_index=0, return_sample_ids=False):
     """Creates mini-batch tensors w/ same length sequences by performing padding to the sequecenses.
     We should build a custom collate_fn to merge sequences w/ padding (not supported in default).
     Seqeuences are padded to the maximum length of mini-batch sequences (dynamic padding), else pad
@@ -71,12 +97,15 @@ def collate_fn(data, fixed_padding=None, pad_index=0):
     trg_seqs = []
     right_hands = []
     left_hands = []
+    sample_ids = []
 
     for element in data:
         src_seqs.append(element['images'])
         trg_seqs.append(element['translation'])
 
         right_hands.append(element['right_hands'])
+        if return_sample_ids:
+            sample_ids.append(str(element['sample_id']))
 
     #pad sequences
     src_seqs, src_lengths = pad(src_seqs, 'source')
@@ -89,6 +118,9 @@ def collate_fn(data, fixed_padding=None, pad_index=0):
         hand_seqs = None
         hand_lengths = None
 
+    if return_sample_ids:
+        return src_seqs, src_lengths, trg_seqs, trg_lengths, hand_seqs, hand_lengths, sample_ids
+
     return src_seqs, src_lengths, trg_seqs, trg_lengths, hand_seqs, hand_lengths
 
 
@@ -96,10 +128,10 @@ def collate_fn(data, fixed_padding=None, pad_index=0):
 class PhoenixDataset(Dataset):
     """Sequential Sign language images dataset."""
 
-    def __init__(self, csv_file, root_dir, segment_path, lookup_table, random_drop, uniform_drop, istrain, transform=None,rescale=224, sos_index=1, eos_index=2, unk_index=0, fixed_padding=None, hand_dir=None, hand_transform=None, channels=3):
+    def __init__(self, csv_file, root_dir, segment_path, lookup_table, random_drop, uniform_drop, istrain, transform=None,rescale=224, sos_index=1, eos_index=2, unk_index=0, fixed_padding=None, hand_dir=None, hand_transform=None, channels=3, return_sample_ids=False):
 
         #Get data
-        self.annotations = pd.read_csv(csv_file)
+        self.annotations = pd.read_csv(csv_file, header=None)
         self.root_dir = root_dir
         self.segment_path= segment_path
         self.hand_dir = hand_dir
@@ -111,6 +143,7 @@ class PhoenixDataset(Dataset):
         self.rescale = rescale
 
         self.channels = channels
+        self.return_sample_ids = return_sample_ids
 
         #index used for eos token and unk
         self.eos_index = eos_index
@@ -138,15 +171,21 @@ class PhoenixDataset(Dataset):
         segments_name= os.path.join(self.segment_path, name)
 
         for path, d, files in os.walk(seq_name):
+            images = sorted(
+                file_name for file_name in files
+                if file_name.lower().endswith(('.png', '.jpg', '.jpeg'))
+            )
+            if not images:
+                continue
             
             if self.istrain:
-                indexs = idxs(len(files),random_drop=self.random_drop,uniform_drop=self.uniform_drop)
+                indexs = idxs(len(images),random_drop=self.random_drop,uniform_drop=self.uniform_drop)
                 seq_length = len(indexs)
             else:
                 if self.random_drop is not None:
-                    indexs = idxs(len(files),random_drop=None,uniform_drop= self.random_drop)
+                    indexs = idxs(len(images),random_drop=None,uniform_drop= self.random_drop)
                 else:
-                    indexs = idxs(len(files),random_drop=None,uniform_drop= self.uniform_drop)
+                    indexs = idxs(len(images),random_drop=None,uniform_drop= self.uniform_drop)
                 seq_length = len(indexs)
 
             trsf_images = torch.zeros((seq_length, self.channels, self.rescale, self.rescale))
@@ -164,25 +203,27 @@ class PhoenixDataset(Dataset):
             #Save the images of seq
             
             i=0
-            images = os.listdir(seq_name)
-            
             for ind in indexs:
                 
                     img=images[ind]
                     
                     
-                    img_name=os.path.join(seq_name,'{}{:03d}'.format(img[:-9],ind)+'-0.png')
-                    seg_name=os.path.join(segments_name,'{}{:03d}'.format(img[:-9],ind)+'-0.npy.gz')
+                    img_name=os.path.join(seq_name,img)
+                    seg_name=os.path.join(segments_name, os.path.splitext(img)[0]+'.npy.gz')
+                    if not os.path.exists(seg_name):
+                        legacy_seg_name=os.path.join(segments_name,'{}{:03d}'.format(img[:-9],ind)+'-0.npy.gz')
+                        if os.path.exists(legacy_seg_name):
+                            seg_name=legacy_seg_name
                     data = gzip.open(seg_name,'rb')
                     segmentation=np.load(data)
-                    image=cv2.imread(img_name)
-                    image= cv2.resize(image,(224,224))
+                    image=read_frame_image(img_name)
+                    image= resize_frame_image(image,(224,224))
                     annotated_image = image.copy()
                     red_img = np.zeros_like(annotated_image, dtype=np.uint8)
                     segm_2class = np.repeat(segmentation[..., np.newaxis], 3, axis=2)
                     annotated_image = annotated_image * segm_2class + red_img * (1 - segm_2class)
                     annotated_image=annotated_image.astype(np.uint8)
-                    annotated_image = cv2.resize(image,(256,256))
+                    annotated_image = resize_frame_image(image,(256,256))
                     if self.istrain:
                         annotated_image = annotated_image[h1:h1 + 224, w1:w1 + 224, :]
                     else:
@@ -199,7 +240,7 @@ class PhoenixDataset(Dataset):
                             hand_images[i-1] = self.hand_transform(io.imread(hand_name_0)[:, :, :self.channels])
 
                     #NOTE: some images got shape of (260, 220, 4)
-                    if(io.imread(img_name).shape[2] == self.channels):
+                    if annotated_image.shape[2] == self.channels:
                         trsf_images[i] = self.transform(annotated_image)
                     else:
                         trsf_images[i] = self.transform(annotated_image[:, :, :self.channels])
@@ -224,9 +265,10 @@ class PhoenixDataset(Dataset):
                 trans.append(self.unk_index)
 
         #NOTE: full frame seq and hand seq should be with the same seq length
-        #sample = {'images': trsf_images, 'right_hands':hand_images, 'translation': trans}
-        return {'images': trsf_images, 'right_hands':hand_images, 'translation': trans}
-        #return sample
+        sample = {'images': trsf_images, 'right_hands':hand_images, 'translation': trans}
+        if self.return_sample_ids:
+            sample['sample_id'] = str(name)
+        return sample
 
 
 # Helper function to show a batch
@@ -264,7 +306,7 @@ class SubtractMeans(object):
         return image
 
 
-def loader(csv_file, root_dir, segment_path, lookup, rescale, batch_size, num_workers, random_drop, uniform_drop, show_sample, istrain=False, mean_path='FulFrame_Mean_Image_227x227.npy', fixed_padding=None, hand_dir=None, data_stats=None, hand_stats=None, channels=3):
+def loader(csv_file, root_dir, segment_path, lookup, rescale, batch_size, num_workers, random_drop, uniform_drop, show_sample, istrain=False, mean_path='FulFrame_Mean_Image_227x227.npy', fixed_padding=None, hand_dir=None, data_stats=None, hand_stats=None, channels=3, return_sample_ids=False):
 
     #Note: when using random cropping, this with reshape images with randomCrop size instead of rescale
     if(istrain):
@@ -360,15 +402,17 @@ def loader(csv_file, root_dir, segment_path, lookup, rescale, batch_size, num_wo
                                             istrain=istrain,
                                             hand_dir=hand_dir,
                                             hand_transform=hand_trans,
-                                            channels = channels
+                                            channels = channels,
+                                            return_sample_ids=return_sample_ids
                                             )
 
     size = len(transformed_dataset)
 
     #Iterate in batches
     #Note: put num of workers to 0 to avoid memory saturation
+    batch_collate = (lambda batch: collate_fn(batch, return_sample_ids=True)) if return_sample_ids else collate_fn
     dataloader = DataLoader(transformed_dataset, batch_size=batch_size,
-                            shuffle=True, num_workers=num_workers, collate_fn=collate_fn)
+                            shuffle=True, num_workers=num_workers, collate_fn=batch_collate)
 
     #Show a sample of the dataset
     if(show_sample and istrain):
