@@ -22,12 +22,18 @@ from tools.offline_registry import init_offline_registry
 from tools.utils import path_data, Batch, LabelSmoothing, NoamOpt
 
 #Progress bar to visualize training progress
-import progressbar
+try:
+    import progressbar
+except ImportError:
+    progressbar = None
 
 import matplotlib.pyplot as plt
 
 #For model summary
-from torchsummary import summary
+try:
+    from torchsummary import summary
+except ImportError:
+    summary = None
 
 #Plotting
 from tools.viz import learning_curve_slr
@@ -39,7 +45,51 @@ except ImportError:
     GPUtil = None
 
 #Lavenghtein distance (WER)
-from jiwer import wer
+try:
+    from jiwer import wer
+except ImportError:
+    def _edit_distance(ref_tokens, hyp_tokens):
+        rows = len(ref_tokens) + 1
+        cols = len(hyp_tokens) + 1
+        dp = [[0] * cols for _ in range(rows)]
+        for i in range(rows):
+            dp[i][0] = i
+        for j in range(cols):
+            dp[0][j] = j
+        for i in range(1, rows):
+            for j in range(1, cols):
+                cost = 0 if ref_tokens[i - 1] == hyp_tokens[j - 1] else 1
+                dp[i][j] = min(
+                    dp[i - 1][j] + 1,
+                    dp[i][j - 1] + 1,
+                    dp[i - 1][j - 1] + cost,
+                )
+        return dp[-1][-1]
+
+    def _normalize_wer_samples(value):
+        if isinstance(value, str):
+            return [value]
+        if value is None:
+            return ['']
+        if isinstance(value, (list, tuple)):
+            return [str(item) for item in value]
+        return [str(value)]
+
+    def wer(reference, hypothesis):
+        references = _normalize_wer_samples(reference)
+        hypotheses = _normalize_wer_samples(hypothesis)
+        if len(references) != len(hypotheses):
+            raise ValueError('reference and hypothesis must have the same number of samples')
+        total_words = 0
+        total_edits = 0
+        for ref, hyp in zip(references, hypotheses):
+            ref_tokens = str(ref).split()
+            hyp_tokens = str(hyp).split()
+            total_words += len(ref_tokens)
+            total_edits += _edit_distance(ref_tokens, hyp_tokens)
+        if total_words == 0:
+            return 0.0
+        return total_edits / total_words
 
 
 def load_checkpoint(model_path, map_location=None):
@@ -607,6 +657,8 @@ def run_epoch(model, data, is_train=False, device=None, n_devices=1):
     # through Jupyter/tee. Keep epoch summaries as the default and make bars opt-in.
     bar = None
     if args.progress == 'bar':
+        if progressbar is None:
+            raise ImportError("progressbar2 is required when --progress bar is used")
         bar = progressbar.ProgressBar(maxval=dataset_sizes[phase], widgets=[progressbar.Bar('=', '[', ']'), ' ', progressbar.Percentage()])
         bar.start()
     j = 0
