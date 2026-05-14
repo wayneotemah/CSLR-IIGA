@@ -9,12 +9,16 @@ import torch.nn as nn
 import numpy as np
 import datetime as dt
 import _pickle as pickle
+import json
 
 
 from torch.optim.lr_scheduler import StepLR, MultiStepLR
 
 from transformer import make_model as TRANSFORMER
 from dataloader import loader
+from tools.ctc_decode import decode_ctc_batch, ids_to_text
+from tools.runtime import select_device, DeviceTelemetryPoller, format_device_telemetry
+from tools.offline_registry import init_offline_registry
 from tools.utils import path_data, Batch, LabelSmoothing, NoamOpt
 
 #Progress bar to visualize training progress
@@ -29,14 +33,244 @@ from torchsummary import summary
 from tools.viz import learning_curve_slr
 
 #Visualize GPU resources
-import GPUtil
+try:
+    import GPUtil
+except ImportError:
+    GPUtil = None
 
 #Lavenghtein distance (WER)
 from jiwer import wer
 
-#NOTE: use tf CTC decoder for decoding
-import tensorflow.compat.v1 as tf
-tf.enable_eager_execution()
+
+def load_checkpoint(model_path, map_location=None):
+    try:
+        return torch.load(model_path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(model_path, map_location=map_location)
+
+def print_device_utilization(device):
+    if device.type != 'cuda' or GPUtil is None:
+        return
+    print(GPUtil.showUtilization())
+
+
+def init_wandb(args, start_date):
+    if not args.wandb or args.wandb_mode == 'disabled':
+        return None
+
+    try:
+        import wandb
+    except ImportError:
+        print("WARNING: --wandb was set but wandb is not installed. Continuing without W&B logging.")
+        return None
+
+    run_name = args.wandb_run_name or f"{args.arch}-{start_date}"
+    tags = [tag.strip() for tag in args.wandb_tags.split(',') if tag.strip()]
+    init_kwargs = {
+        'entity': args.wandb_entity,
+        'project': args.wandb_project,
+        'name': run_name,
+        'tags': tags,
+        'config': vars(args),
+    }
+    if args.wandb_group:
+        init_kwargs['group'] = args.wandb_group
+    if args.wandb_job_type:
+        init_kwargs['job_type'] = args.wandb_job_type
+    if args.wandb_system_sample_seconds > 0:
+        init_kwargs['settings'] = getattr(wandb, 'Settings')(x_stats_sampling_interval=args.wandb_system_sample_seconds)
+    if args.wandb_mode == 'offline':
+        init_kwargs['mode'] = 'offline'
+    if args.wandb_dir:
+        init_kwargs['dir'] = args.wandb_dir
+
+    try:
+        return getattr(wandb, 'init')(**init_kwargs)
+    except Exception as exc:
+        print(f"WARNING: failed to initialize W&B ({exc}). Continuing without W&B logging.")
+        return None
+
+
+def log_wandb(wandb_run, metrics):
+    if wandb_run is None:
+        return
+
+    try:
+        wandb_run.log(metrics, step=metrics.get('epoch'))
+    except Exception as exc:
+        print(f"WARNING: failed to log W&B metrics ({exc}). Continuing training.")
+
+
+def current_learning_rate(optimizer):
+    if not optimizer.param_groups:
+        return 0.0
+    return optimizer.param_groups[0].get('lr', 0.0)
+
+
+def cr_ctc_consistency_loss(log_probs_a, log_probs_b, input_lengths):
+    """Symmetric stop-gradient KL over valid CTC time steps."""
+    log_probs_a = log_probs_a.transpose(0, 1)
+    log_probs_b = log_probs_b.transpose(0, 1)
+    probs_a = log_probs_a.exp().detach()
+    probs_b = log_probs_b.exp().detach()
+
+    max_time = log_probs_a.size(1)
+    lengths = input_lengths.to(log_probs_a.device)
+    frame_index = torch.arange(max_time, device=log_probs_a.device).unsqueeze(0)
+    valid_mask = frame_index < lengths.unsqueeze(1)
+    valid_mask = valid_mask.to(log_probs_a.dtype)
+
+    kl_a_to_b = F.kl_div(log_probs_b, probs_a, reduction='none').sum(dim=-1)
+    kl_b_to_a = F.kl_div(log_probs_a, probs_b, reduction='none').sum(dim=-1)
+    valid_count = valid_mask.sum().clamp_min(1.0)
+    return 0.5 * ((kl_a_to_b * valid_mask).sum() + (kl_b_to_a * valid_mask).sum()) / valid_count
+
+
+def read_corpus_ids(csv_path):
+    ids = set()
+    if not csv_path or not os.path.exists(csv_path):
+        return ids
+
+    with open(csv_path, 'r', encoding='utf-8') as handle:
+        for line in handle:
+            row = line.strip()
+            if not row:
+                continue
+            ids.add(row.split('|', 1)[0])
+
+    return ids
+
+
+def _first_present(mapping, keys):
+    for key in keys:
+        if key in mapping:
+            return mapping[key]
+    return None
+
+
+def _collect_anchor_entries(node):
+    if isinstance(node, list):
+        entries = []
+        for item in node:
+            entries.extend(_collect_anchor_entries(item))
+        return entries
+
+    if not isinstance(node, dict):
+        return []
+
+    if any(key in node for key in ('sample_id', 'id', 'sequence_id')) and any(key in node for key in ('frame_idx', 'frame', 'time_idx')):
+        return [node]
+
+    entries = []
+    for key in ('eligible_anchors', 'anchors', 'eligible'):
+        if key in node:
+            entries.extend(_collect_anchor_entries(node[key]))
+    return entries
+
+
+def load_anchor_audit(anchor_audit_json, word_to_id, vocab_size, train_csv, valid_csv, test_csv):
+    with open(anchor_audit_json, 'r', encoding='utf-8') as handle:
+        audit = json.load(handle)
+
+    for leakage_key in ('validation_ids_in_anchors', 'valid_ids_in_anchors', 'test_ids_in_anchors'):
+        leaked_ids = audit.get(leakage_key, []) if isinstance(audit, dict) else []
+        if leaked_ids:
+            raise ValueError(f"Anchor audit reports leakage in {leakage_key}: {leaked_ids}")
+
+    train_ids = read_corpus_ids(train_csv)
+    valid_ids = read_corpus_ids(valid_csv)
+    test_ids = read_corpus_ids(test_csv)
+    forbidden_ids = valid_ids | test_ids
+
+    anchor_map = {}
+    skipped_unknown_tokens = 0
+    skipped_invalid = 0
+    skipped_non_train = 0
+
+    for entry in _collect_anchor_entries(audit):
+        if entry.get('eligible') is False:
+            continue
+
+        sample_id = _first_present(entry, ('sample_id', 'id', 'sequence_id'))
+        frame_idx = _first_present(entry, ('frame_idx', 'frame', 'time_idx'))
+        token_id = entry.get('token_id')
+
+        if token_id is None:
+            token_text = _first_present(entry, ('token', 'token_text'))
+            if token_text not in word_to_id:
+                skipped_unknown_tokens += 1
+                continue
+            token_id = word_to_id[token_text]
+
+        if sample_id is None or frame_idx is None:
+            skipped_invalid += 1
+            continue
+
+        try:
+            sample_id = str(sample_id)
+            frame_idx = int(frame_idx)
+            token_id = int(token_id)
+        except (TypeError, ValueError):
+            skipped_invalid += 1
+            continue
+
+        if token_id < 0 or token_id >= vocab_size or frame_idx < 0:
+            skipped_invalid += 1
+            continue
+
+        if sample_id in forbidden_ids:
+            raise ValueError(f"Anchor audit contains validation/test sample id {sample_id}")
+        if train_ids and sample_id not in train_ids:
+            skipped_non_train += 1
+            continue
+
+        anchor_map.setdefault(sample_id, []).append((frame_idx, token_id))
+
+    for sample_anchors in anchor_map.values():
+        sample_anchors.sort(key=lambda item: item[0])
+
+    total_anchors = sum(len(sample_anchors) for sample_anchors in anchor_map.values())
+    unique_tokens = {token_id for sample_anchors in anchor_map.values() for _, token_id in sample_anchors}
+
+    if not total_anchors:
+        raise ValueError(f"No usable eligible anchors loaded from {anchor_audit_json}")
+
+    print(f"Loaded {total_anchors} eligible anchors for {len(unique_tokens)} unique tokens across {len(anchor_map)} samples")
+    if skipped_unknown_tokens or skipped_invalid or skipped_non_train:
+        print(
+            "Skipped anchors - unknown tokens: %d, invalid: %d, non-train: %d" %
+            (skipped_unknown_tokens, skipped_invalid, skipped_non_train)
+        )
+
+    return anchor_map
+
+
+def compute_anchor_ce(output_context, sample_ids, raw_x_lengths, anchor_map_by_sample_id):
+    if sample_ids is None or not anchor_map_by_sample_id:
+        return None, 0
+
+    losses = []
+    max_time = output_context.size(1)
+    device = output_context.device
+
+    for batch_idx, sample_id in enumerate(sample_ids):
+        sample_anchors = anchor_map_by_sample_id.get(str(sample_id), [])
+        if not sample_anchors:
+            continue
+
+        raw_length = int(raw_x_lengths[batch_idx]) if batch_idx < len(raw_x_lengths) else max_time
+        valid_time = min(raw_length, max_time)
+        for frame_idx, token_id in sample_anchors:
+            if frame_idx >= valid_time:
+                continue
+            target = torch.tensor([token_id], dtype=torch.long, device=device)
+            losses.append(F.nll_loss(output_context[batch_idx, frame_idx].unsqueeze(0), target, reduction='sum'))
+
+    if not losses:
+        return None, 0
+
+    anchor_loss = torch.stack(losses).sum() / len(losses)
+    return anchor_loss, len(losses)
 
 # parser helper for optional probabilities in [0, 1]
 def optional_probability(value):
@@ -144,6 +378,11 @@ parser.add_argument('--emb_type', type=str, default='2d',
 parser.add_argument('--emb_network', type=str, default='mb2',
                     help='Image embeddings network: mb2/i3d/m3d')
 
+parser.add_argument('--encoder_type', type=str, default='legacy', choices=['legacy', 'conformer'],
+                    help='sequence encoder type; legacy preserves the original CSLR-IIGA encoder path')
+parser.add_argument('--conformer_kernel_size', type=int, default=17,
+                    help='depthwise convolution kernel size for --encoder_type conformer; must be odd')
+
 parser.add_argument('--image_type', type=str, default='rgb',
                     help='Train on rgb/grayscale images')
 
@@ -202,6 +441,60 @@ parser.add_argument('--data_stats', type=str, default=None,
 parser.add_argument('--hand_stats', type=str, default=None,
                     help="Normalize images using the dataset stats (mean/std).")
 
+parser.add_argument('--wandb', action='store_true',
+                    help='Enable optional Weights & Biases logging.')
+
+parser.add_argument('--wandb_entity', type=str, default='ishara-ke',
+                    help='Weights & Biases entity/team name.')
+
+parser.add_argument('--wandb_project', type=str, default='CSLR-IIGA',
+                    help='Weights & Biases project name.')
+
+parser.add_argument('--wandb_run_name', type=str, default=None,
+                    help='Optional Weights & Biases run name.')
+
+parser.add_argument('--wandb_tags', type=str, default='',
+                    help='Comma-separated Weights & Biases tags.')
+
+parser.add_argument('--wandb_group', type=str, default=None,
+                    help='Optional Weights & Biases group for related train/eval runs.')
+
+parser.add_argument('--wandb_job_type', type=str, default='train',
+                    help='Weights & Biases job type, e.g. train, preview, eval.')
+
+parser.add_argument('--wandb_system_sample_seconds', type=float, default=5.0,
+                    help='W&B system/GPU stats sampling interval in seconds; set <=0 to use W&B default.')
+parser.add_argument('--wandb_mode', type=str, default='online', choices=['online', 'offline', 'disabled'],
+                    help='W&B mode when --wandb is set.')
+parser.add_argument('--wandb_dir', type=str, default=None,
+                    help='Optional directory for W&B run files, useful for offline mode.')
+parser.add_argument('--offline_registry_root', type=str, default=None,
+                    help='Optional local registry root for W&B-independent run records.')
+
+parser.add_argument('--progress', choices=['epoch', 'bar', 'none'], default='epoch',
+                    help='Progress display mode. Use epoch for log-friendly summaries, bar for interactive redraws, none to suppress progress lines.')
+
+parser.add_argument('--ctc_blank_logit_penalty', type=float, default=0.0,
+                    help='Subtract this value from the CTC blank logit before loss/decode. Default 0 keeps baseline behavior.')
+
+parser.add_argument('--interctc_weight', type=float, default=0.0,
+                    help='Weight for optional intermediate encoder CTC loss. Default 0 keeps baseline behavior.')
+
+parser.add_argument('--interctc_layer', type=int, default=None,
+                    help='Zero-based encoder layer index for optional intermediate CTC. Default uses the middle encoder layer.')
+
+parser.add_argument('--cr_ctc_weight', type=float, default=0.0,
+                    help='Weight for optional consistency-regularized CTC. Default 0 keeps baseline behavior.')
+
+parser.add_argument('--visual_ctc_weight', type=float, default=0.0,
+                    help='Weight for optional visual-embedding CTC loss before the Transformer. Default 0 keeps baseline behavior.')
+
+parser.add_argument('--anchor_ce_weight', type=float, default=0.0,
+                    help='Weight for optional evidence-gated anchor-frame CE loss. Default 0 keeps baseline behavior.')
+
+parser.add_argument('--anchor_audit_json', type=str, default=None,
+                    help='Path to a train-only anchor audit JSON used when --anchor_ce_weight is enabled.')
+
 
 #----------------------------------------------------------------------------------------
 
@@ -216,6 +509,24 @@ start_date = dt.datetime.now().strftime("%Y-%m-%d-%H.%M")
 print ("Start Time: "+start_date)
 
 args = parser.parse_args()
+
+if args.encoder_type == 'conformer' and args.hand_query:
+    parser.error('--encoder_type conformer is not supported with --hand_query in the first Conformer branch.')
+
+if args.anchor_ce_weight < 0.0:
+    parser.error('--anchor_ce_weight must be non-negative.')
+
+if args.anchor_ce_weight > 0.0:
+    if not args.anchor_audit_json:
+        parser.error('--anchor_audit_json is required when --anchor_ce_weight is enabled.')
+    if args.hand_query:
+        parser.error('--anchor_ce_weight is not supported with --hand_query in the first anchor branch.')
+    if args.distributed:
+        parser.error('--anchor_ce_weight is not supported with --distributed in the first anchor branch.')
+    if args.interctc_weight > 0.0 or args.cr_ctc_weight > 0.0 or args.visual_ctc_weight > 0.0:
+        parser.error('--anchor_ce_weight must not be combined with InterCTC, CR-CTC, or visual CTC in the first anchor branch.')
+    if args.ctc_blank_logit_penalty != 0.0:
+        parser.error('--anchor_ce_weight must not be combined with --ctc_blank_logit_penalty in the first anchor branch.')
 
 #Set the random seed manually for reproducibility.
 torch.manual_seed(args.seed)
@@ -241,22 +552,29 @@ with open (os.path.join(experiment_path,'exp_config.txt'), 'w') as f:
     for arg in vars(args):
         f.write(arg+' : '+str(getattr(args, arg))+'\n')
 
+wandb_run = init_wandb(args, start_date)
+offline_registry = init_offline_registry(
+    args.offline_registry_root,
+    run_id=args.wandb_run_name or start_date,
+    config=vars(args),
+    metadata={
+        'start_date': start_date,
+        'save_dir': args.save_dir,
+        'exp_config_path': os.path.join(args.save_dir, 'exp_config.txt'),
+    },
+)
+
 #-------------------------------------------------------------------------------
-#Run on GPU
-if torch.cuda.is_available():
-    print('Nmber of GPUs={}',torch.cuda.device_count())
-    print('Device name:{}',torch.cuda.get_device_name(0))
-    print("Training ", args.arch, " on GPU!")
-    device = torch.device("cuda:0")
-else:
-#Run on CPU
-    print("WARNING: Training on CPU, this will likely run out of memory, Go buy yourself a GPU!")
-    device = torch.device("cpu")
+device = select_device(verbose=True, context=f"Training {args.arch}")
+telemetry_poller = DeviceTelemetryPoller(device)
 #--------------------------------------------------------------------------------
 
 
 #Computation for one epoch
-def run_epoch(model, data, is_train=False, device='cuda:0', n_devices=1):
+def run_epoch(model, data, is_train=False, device=None, n_devices=1):
+
+    if device is None:
+        raise ValueError('run_epoch requires an explicit device')
 
     if is_train:
         model.train()  # Set model to training mode
@@ -285,16 +603,30 @@ def run_epoch(model, data, is_train=False, device='cuda:0', n_devices=1):
     gt = []
     hyp = []
 
-    #For progress bar
-    bar = progressbar.ProgressBar(maxval=dataset_sizes[phase], widgets=[progressbar.Bar('=', '[', ']'), ' ', progressbar.Percentage()])
-    bar.start()
+    # Progress bars redraw repeatedly and flood persistent logs when output is captured
+    # through Jupyter/tee. Keep epoch summaries as the default and make bars opt-in.
+    bar = None
+    if args.progress == 'bar':
+        bar = progressbar.ProgressBar(maxval=dataset_sizes[phase], widgets=[progressbar.Bar('=', '[', ']'), ' ', progressbar.Percentage()])
+        bar.start()
     j = 0
     #Loop over minibatches
-    for step, (x, x_lengths, y, y_lengths, hand_regions, hand_lengths) in enumerate(data):
+    for step, batch_data in enumerate(data):
+
+        if len(batch_data) == 7:
+            x, x_lengths, y, y_lengths, hand_regions, hand_lengths, sample_ids = batch_data
+        elif len(batch_data) == 6:
+            x, x_lengths, y, y_lengths, hand_regions, hand_lengths = batch_data
+            sample_ids = None
+        else:
+            raise ValueError(f"Unexpected batch structure with {len(batch_data)} values")
+
+        raw_x_lengths = list(x_lengths)
 
         #Update progress bar with every iter
         j += len(x)
-        bar.update(j)
+        if bar is not None:
+            bar.update(j)
 
         #print(x.size())
         y = torch.from_numpy(y).to(device)
@@ -307,6 +639,11 @@ def run_epoch(model, data, is_train=False, device='cuda:0', n_devices=1):
 
         #NOTE: clone y to avoid overridding it
         batch = Batch(x_lengths, y_lengths, hand_lengths, trg=None, emb_type=args.emb_type, DEVICE=device, fixed_padding=args.fixed_padding, rel_window=args.rel_window)
+
+        output_interctc = None
+        output_visual_ctc = None
+        output_context_cr = None
+        output_cr = None
 
         if(args.distributed):
 
@@ -342,7 +679,45 @@ def run_epoch(model, data, is_train=False, device='cuda:0', n_devices=1):
 
             #Shape(batch_size, tgt_seq_length, tgt_vocab_size)
             #NOTE: no need for trg if we dont have a decoder
-            output, output_context, output_hand = model.forward(x, batch.src_mask, batch.rel_mask, hand_regions, args.arch)
+            use_interctc = args.interctc_weight > 0 and not args.hand_query
+            use_visual_ctc = args.visual_ctc_weight > 0 and not args.hand_query
+            use_cr_ctc = args.cr_ctc_weight > 0 and is_train and not args.hand_query
+
+            if use_interctc and use_visual_ctc:
+                output, output_context, output_hand, output_interctc, output_visual_ctc = model.forward(
+                    x,
+                    batch.src_mask,
+                    batch.rel_mask,
+                    hand_regions,
+                    args.arch,
+                    return_intermediate_ctc=True,
+                    intermediate_ctc_layer=args.interctc_layer,
+                    return_visual_ctc=True,
+                )
+            elif use_interctc:
+                output, output_context, output_hand, output_interctc = model.forward(
+                    x,
+                    batch.src_mask,
+                    batch.rel_mask,
+                    hand_regions,
+                    args.arch,
+                    return_intermediate_ctc=True,
+                    intermediate_ctc_layer=args.interctc_layer,
+                )
+            elif use_visual_ctc:
+                output, output_context, output_hand, output_visual_ctc = model.forward(
+                    x,
+                    batch.src_mask,
+                    batch.rel_mask,
+                    hand_regions,
+                    args.arch,
+                    return_visual_ctc=True,
+                )
+            else:
+                output, output_context, output_hand = model.forward(x, batch.src_mask, batch.rel_mask, hand_regions, args.arch)
+
+            if use_cr_ctc:
+                _, output_context_cr, _ = model.forward(x, batch.src_mask, batch.rel_mask, hand_regions, args.arch)
 
         #CTC loss expects (Seq, batch, vocab)
         if(args.hand_query):
@@ -351,6 +726,30 @@ def run_epoch(model, data, is_train=False, device='cuda:0', n_devices=1):
             output_hand = output_hand.transpose(0,1)
         else:
             output = output_context.transpose(0,1)
+            if output_interctc is not None:
+                output_interctc = output_interctc.transpose(0,1)
+            if output_visual_ctc is not None:
+                output_visual_ctc = output_visual_ctc.transpose(0,1)
+            if output_context_cr is not None:
+                output_cr = output_context_cr.transpose(0,1)
+
+        if args.ctc_blank_logit_penalty:
+            output = output.clone()
+            output[:, :, blank_index] -= args.ctc_blank_logit_penalty
+            if output_cr is not None:
+                output_cr = output_cr.clone()
+                output_cr[:, :, blank_index] -= args.ctc_blank_logit_penalty
+            if output_interctc is not None:
+                output_interctc = output_interctc.clone()
+                output_interctc[:, :, blank_index] -= args.ctc_blank_logit_penalty
+            if output_visual_ctc is not None:
+                output_visual_ctc = output_visual_ctc.clone()
+                output_visual_ctc[:, :, blank_index] -= args.ctc_blank_logit_penalty
+            if args.hand_query:
+                output_context = output_context.clone()
+                output_hand = output_hand.clone()
+                output_context[:, :, blank_index] -= args.ctc_blank_logit_penalty
+                output_hand[:, :, blank_index] -= args.ctc_blank_logit_penalty
 
         i=0
         for x_length in x_lengths:
@@ -365,30 +764,13 @@ def run_epoch(model, data, is_train=False, device='cuda:0', n_devices=1):
 
 
         if(is_train==False):
+            decoded_preds = decode_ctc_batch(output, x_lengths, blank_index)
 
-            #Run CTC beam decoder using tensorflow
-            #NOTE: blank token in Tensorflow must be  (N-classes - 1)
-
-            #Return tuple of sentences and probs
-            decodes, _ = tf.nn.ctc_beam_search_decoder(inputs=output.cpu().detach().numpy(),
-                                 sequence_length=x_lengths.cpu().detach().numpy(), merge_repeated=True, beam_width=10, top_paths=1)
-            #Get top 1 path
-            #(batch, Seq)
-            pred = decodes[0]
-
-            #Transform sparse tensor to numpy
-            pred = tf.sparse.to_dense(pred).numpy()
-
-            for i in range(len(y)):
-
-                #NOTE: we are doing log inside ctcdecoder
-                #pred = (seq, beam, batch)
-
+            for i, p in enumerate(decoded_preds):
                 ys = y[i, :y_lengths[i]]
-                p = pred[i]
 
-                hyp = (' '.join([vocab[x.item()] for x in p]))
-                gt = (' '.join([vocab[x.item()] for x in ys]))
+                hyp = ids_to_text(p, vocab, ignore_ids=[blank_index, pad_index])
+                gt = ids_to_text(ys.tolist(), vocab, ignore_ids=[blank_index, pad_index])
 
                 total_wer_score += wer(gt, hyp)
                 count += 1
@@ -405,12 +787,35 @@ def run_epoch(model, data, is_train=False, device='cuda:0', n_devices=1):
         #IMPORTANT: Use Pytorch CTCloss
         #print(output.shape)
         #print(y.shape)
-        loss = ctc_loss(output, y.cpu(), x_lengths.cpu(), y_lengths.cpu())
+        if output_cr is not None:
+            ctc_loss_a = ctc_loss(output, y.cpu(), x_lengths.cpu(), y_lengths.cpu())
+            ctc_loss_b = ctc_loss(output_cr, y.cpu(), x_lengths.cpu(), y_lengths.cpu())
+            consistency_loss = cr_ctc_consistency_loss(output, output_cr, x_lengths)
+            loss = 0.5 * (ctc_loss_a + ctc_loss_b) + args.cr_ctc_weight * consistency_loss
+        else:
+            loss = ctc_loss(output, y.cpu(), x_lengths.cpu(), y_lengths.cpu())
+
+        if output_interctc is not None:
+            interctc_loss = ctc_loss(output_interctc, y.cpu(), x_lengths.cpu(), y_lengths.cpu())
+            loss = loss + args.interctc_weight * interctc_loss
+
+        if output_visual_ctc is not None:
+            visual_ctc_loss = ctc_loss(output_visual_ctc, y.cpu(), x_lengths.cpu(), y_lengths.cpu())
+            loss = loss + args.visual_ctc_weight * visual_ctc_loss
 
         if(args.hand_query):
             loss += ctc_loss(output_context, y.cpu(), x_lengths.cpu(), y_lengths.cpu())
             loss += ctc_loss(output_hand, y.cpu(), x_lengths.cpu(), y_lengths.cpu())
             loss = loss / 3
+
+        last_anchor_ce = None
+        last_anchor_count = 0
+        if is_train and args.anchor_ce_weight > 0.0:
+            anchor_ce, anchor_count = compute_anchor_ce(output_context, sample_ids, raw_x_lengths, anchor_map_by_sample_id)
+            if anchor_count > 0 and torch.isfinite(anchor_ce):
+                loss = loss + args.anchor_ce_weight * anchor_ce
+                last_anchor_ce = anchor_ce.detach().item()
+                last_anchor_count = anchor_count
 
         total_loss += loss
         total_seqs += batch.seq
@@ -429,8 +834,16 @@ def run_epoch(model, data, is_train=False, device='cuda:0', n_devices=1):
 
             if step % 100 == 0:
                 elapsed = time.time() - start_time
+                telemetry = format_device_telemetry(telemetry_poller.sample())
                 print("Step: %d, Loss: %f, Frame per Sec: %f, Token per sec: %f"%
                       (step, (loss / batch_tokens), total_seqs * batch_size / elapsed, tokens / elapsed))
+                if args.anchor_ce_weight > 0.0:
+                    if last_anchor_ce is None:
+                        print("Anchor CE: skipped, Anchors: 0")
+                    else:
+                        print("Anchor CE: %.6f, Anchors: %d" % (last_anchor_ce, last_anchor_count))
+                if telemetry:
+                    print(f"Telemetry: {telemetry}")
 
                 start_time = time.time()
                 total_seqs = 0
@@ -440,7 +853,13 @@ def run_epoch(model, data, is_train=False, device='cuda:0', n_devices=1):
 
         #Free some memory
         #NOTE: this helps alot in avoiding cuda out of memory
-        del loss, output, output_context, output_hand, y, hand_regions, batch
+        del loss, output, output_context, output_hand, output_interctc, output_visual_ctc, output_context_cr, output_cr, y, hand_regions, batch
+
+    if bar is not None:
+        bar.finish()
+
+    if args.progress == 'epoch':
+        print(f"{phase.capitalize()} epoch complete: {j}/{dataset_sizes[phase]} examples")
 
     if(is_train):
         print("Average Loss: %f" %(total_loss.item() / total_tokens.item()))
@@ -506,7 +925,8 @@ train_dataloader, train_size = loader(csv_file=train_path[1],
                 hand_dir=train_path[2],
                 data_stats=args.data_stats,
                 hand_stats=args.hand_stats,
-                channels=channels
+                channels=channels,
+                return_sample_ids=args.anchor_ce_weight > 0.0
                 )
 
 #No data augmentation for valid data
@@ -538,10 +958,24 @@ print(dataset_sizes)
 with open(args.lookup_table, 'rb') as pickle_file:
    vocab = pickle.load(pickle_file)
 
-vocab_size = len(vocab)
+word_to_id = vocab
+vocab_size = len(word_to_id)
+pad_index = word_to_id.get('<PAD>', 0)
+blank_index = word_to_id.get('<BLANK>', vocab_size - 1)
+
+anchor_map_by_sample_id = {}
+if args.anchor_ce_weight > 0.0:
+    anchor_map_by_sample_id = load_anchor_audit(
+        args.anchor_audit_json,
+        word_to_id,
+        vocab_size,
+        train_path[1],
+        valid_path[1],
+        test_path[1],
+    )
 
 #Switch keys and values of vocab to easily look for words
-vocab = {y:x for x,y in vocab.items()}
+vocab = {y:x for x,y in word_to_id.items()}
 
 #You should find
 print('vocabulary size:' + str(vocab_size))
@@ -552,14 +986,15 @@ print('vocabulary size:' + str(vocab_size))
 model = TRANSFORMER(tgt_vocab=vocab_size, n_stacks=args.num_layers, n_units=args.hidden_size,
                             n_heads=args.n_heads, window_size=args.local_window ,d_ff=args.d_ff, dropout=1.-args.dp_keep_prob, image_size=args.rescale, pretrained=args.pretrained,
                             emb_type=args.emb_type, emb_network=args.emb_network,
-                            full_pretrained=args.full_pretrained, hand_pretrained=args.hand_pretrained, freeze_cnn=args.freeze_cnn, channels=channels)
+                            full_pretrained=args.full_pretrained, hand_pretrained=args.hand_pretrained, freeze_cnn=args.freeze_cnn, channels=channels,
+                            encoder_type=args.encoder_type, conformer_kernel_size=args.conformer_kernel_size)
 trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 print('model parameters:',trainable_params)
 #summary(model,(64,224,224,3), batch_size=-1, device='cuda')
 #print(model)
 #Load model on GPU or multiple GPUs
-if torch.cuda.device_count() > 1 and args.parallel:
+if device.type == 'cuda' and torch.cuda.device_count() > 1 and args.parallel:
     #How many GPUs you are using
     n_devices = torch.cuda.device_count()
 
@@ -630,8 +1065,15 @@ else:
 #Load weights from previous training session
 #Resume training or start from start w/ pretrained weights
 if(args.checkpoint):
-    checkpoint = torch.load(args.checkpoint)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    checkpoint = load_checkpoint(args.checkpoint, map_location=device)
+    if 'interctc_output_layer.proj.weight' not in checkpoint['model_state_dict']:
+        checkpoint['model_state_dict']['interctc_output_layer.proj.weight'] = checkpoint['model_state_dict']['output_layer.proj.weight'].clone()
+        checkpoint['model_state_dict']['interctc_output_layer.proj.bias'] = checkpoint['model_state_dict']['output_layer.proj.bias'].clone()
+    load_result = model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+    if load_result.missing_keys:
+        print('Missing checkpoint keys initialized from current model: ' + ', '.join(load_result.missing_keys))
+    if load_result.unexpected_keys:
+        print('Unexpected checkpoint keys ignored: ' + ', '.join(load_result.unexpected_keys))
 
     if(args.resume):
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -659,8 +1101,6 @@ if(args.checkpoint == None or args.resume == False):
     else:
         loss_fn = nn.NLLLoss(ignore_index=0, size_average=False)
 
-blank_index = len(vocab)-1
-
 #zero_infinity to avoid having numerical instabilities
 #NOTE: N-class - 1 is for BLANK token if we are using tensorflow decoder
 ctc_loss = nn.CTCLoss(blank=blank_index, reduction='sum', zero_infinity=True)
@@ -679,7 +1119,7 @@ for epoch in range(start_epoch, num_epochs):
     # RUN MODEL ON TRAINING DATA
     train_loss = run_epoch(model, train_dataloader, True, device=device)
     print("After train epoch..")
-    print(GPUtil.showUtilization())
+    print_device_utilization(device)
 
     #Save perplexity
     train_ppl = np.exp(train_loss)
@@ -687,7 +1127,7 @@ for epoch in range(start_epoch, num_epochs):
     if(args.scheduler):
         scheduler.step()
     
-    if(epoch % args.valid_steps == 0):
+    if(args.valid_steps > 0 and epoch % args.valid_steps == 0):
 
         #Use it for evaluation with blue
         translation_corpus = []
@@ -696,7 +1136,7 @@ for epoch in range(start_epoch, num_epochs):
         #RUN MODEL ON VALIDATION DATA
         #NOTE: Helps with avoiding memory saturation
         with torch.no_grad():
-            val_loss, word_err = run_epoch(model, valid_dataloader)
+            val_loss, word_err = run_epoch(model, valid_dataloader, device=device)
 
             if word_err < best_err_so_far:
                 best_err_so_far = word_err
@@ -740,6 +1180,24 @@ for epoch in range(start_epoch, num_epochs):
 
         print(log_str)
 
+        epoch_metrics = {
+            'epoch': epoch,
+            'learning_rate': float(current_learning_rate(optimizer)),
+            'train/ppl': float(train_ppl),
+            'train/loss': float(train_loss),
+            'valid/ppl': float(val_ppl),
+            'valid/loss': float(val_loss),
+            'valid/wer': float(word_err),
+            'valid/best_wer': float(best_err_so_far),
+            'time/epoch_seconds': float(times[-1]),
+        }
+        log_wandb(wandb_run, epoch_metrics)
+        if offline_registry is not None:
+            try:
+                offline_registry.log_metrics(epoch_metrics)
+            except Exception as exc:
+                print(f"Warning: Offline registry logging failed: {exc}")
+
         with open (os.path.join(args.save_dir, 'log.txt'), 'a') as f_:
                 f_.write(log_str+ '\n')
 
@@ -775,3 +1233,6 @@ for epoch in range(start_epoch, num_epochs):
         if(train_ppl <= 1):
             print("YAy!!")
             break
+
+if wandb_run is not None:
+    wandb_run.finish()
