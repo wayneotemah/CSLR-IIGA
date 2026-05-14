@@ -1,36 +1,96 @@
 import argparse
 import _pickle as pickle
+from pathlib import Path
+
 import torch
 
 from dataloader import loader
+from tools.ctc_decode import decode_ctc_batch, ids_to_text
+from tools.runtime import select_device
 from tools.utils import path_data, Batch
 from transformer import make_model as TRANSFORMER
 
 
-def ids_to_text(ids, vocab_inv, ignore_ids=None):
-    ignore_ids = set(ignore_ids or [])
-    tokens = []
-    for idx in ids:
-        if idx in ignore_ids:
-            continue
-        token = vocab_inv.get(int(idx), '<UNK>')
-        if token.startswith('<') and token.endswith('>'):
-            continue
-        tokens.append(token)
-    return ' '.join(tokens).strip()
+def init_wandb(args):
+    if not args.wandb or args.wandb_mode == 'disabled':
+        return None
+
+    try:
+        import wandb
+    except ImportError:
+        print("WARNING: --wandb was set but wandb is not installed. Continuing without W&B logging.")
+        return None
+
+    tags = [tag.strip() for tag in args.wandb_tags.split(',') if tag.strip()]
+    run_name = args.wandb_run_name or f"preview-{Path(args.model_path).stem}"
+    try:
+        wandb_init = getattr(wandb, 'init')
+        init_kwargs = {
+            'entity': args.wandb_entity,
+            'project': args.wandb_project,
+            'name': run_name,
+            'tags': tags,
+            'config': vars(args),
+        }
+        if args.wandb_group:
+            init_kwargs['group'] = args.wandb_group
+        if args.wandb_job_type:
+            init_kwargs['job_type'] = args.wandb_job_type
+        if args.wandb_mode == 'offline':
+            init_kwargs['mode'] = 'offline'
+        if args.wandb_dir:
+            init_kwargs['dir'] = args.wandb_dir
+        return wandb_init(**init_kwargs)
+    except Exception as exc:
+        print(f"WARNING: failed to initialize W&B ({exc}). Continuing without W&B logging.")
+        return None
 
 
-def ctc_greedy_decode(frame_ids, blank_idx):
-    collapsed = []
-    prev = None
-    for idx in frame_ids:
-        if idx == prev:
-            continue
-        prev = idx
-        if idx == blank_idx:
-            continue
-        collapsed.append(idx)
-    return collapsed
+def log_wandb_preview(wandb_run, args, rows):
+    if wandb_run is None:
+        return
+
+    try:
+        import wandb
+
+        wandb_table = getattr(wandb, 'Table')
+        wandb_artifact = getattr(wandb, 'Artifact')
+
+        table = wandb_table(columns=['idx', 'split', 'ground_truth', 'prediction', 'exact_match', 'is_blank'])
+        for row in rows:
+            table.add_data(
+                row['idx'],
+                args.split,
+                row['ground_truth'],
+                row['prediction'],
+                row['exact_match'],
+                row['is_blank'],
+            )
+
+        artifact_name = args.wandb_artifact_name or f"{Path(args.model_path).stem}-{args.split}-checkpoint"
+        artifact = wandb_artifact(
+            name=artifact_name,
+            type='model',
+            metadata={
+                'model_path': args.model_path,
+                'split': args.split,
+                'num_examples': len(rows),
+                'source_run': args.wandb_source_run,
+                'source_artifact': args.wandb_source_artifact,
+            },
+        )
+        artifact.add_file(args.model_path)
+        wandb_run.log_artifact(artifact, aliases=args.wandb_artifact_aliases.split(','))
+        wandb_run.log({
+            'preview/predictions': table,
+            'preview/exact_matches': sum(1 for row in rows if row['exact_match']),
+            'preview/blank_predictions': sum(1 for row in rows if row['is_blank']),
+            'preview/num_examples': len(rows),
+            'preview/source_run': args.wandb_source_run or '',
+            'preview/source_artifact': args.wandb_source_artifact or '',
+        })
+    except Exception as exc:
+        print(f"WARNING: failed to log W&B preview artifacts ({exc}).")
 
 
 def pick_split_paths(data_root, split, hand_query=False):
@@ -56,8 +116,6 @@ def load_checkpoint(model, model_path, device):
     else:
         model.load_state_dict(ckpt)
     return model
-
-
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Print GT vs prediction examples from a checkpoint.')
     parser.add_argument('--data', required=True, help='Prepared dataset root (PHOENIX-compatible layout).')
@@ -77,13 +135,31 @@ if __name__ == '__main__':
     parser.add_argument('--emb_type', type=str, default='2d')
     parser.add_argument('--emb_network', type=str, default='mb2')
     parser.add_argument('--hand_query', action='store_true')
+    parser.add_argument('--encoder_type', type=str, default='legacy', choices=['legacy', 'conformer'])
+    parser.add_argument('--conformer_kernel_size', type=int, default=17)
     parser.add_argument('--image_type', type=str, default='rgb', choices=['rgb', 'grayscale'])
     parser.add_argument('--local_window', type=int, default=10)
     parser.add_argument('--fixed_padding', type=int, default=None)
+    parser.add_argument('--wandb', action='store_true', help='Log checkpoint artifact and GT/PRED preview table to W&B.')
+    parser.add_argument('--wandb_entity', type=str, default='ishara-ke')
+    parser.add_argument('--wandb_project', type=str, default='CSLR-IIGA')
+    parser.add_argument('--wandb_run_name', type=str, default=None)
+    parser.add_argument('--wandb_tags', type=str, default='preview')
+    parser.add_argument('--wandb_group', type=str, default=None)
+    parser.add_argument('--wandb_job_type', type=str, default='preview')
+    parser.add_argument('--wandb_mode', type=str, default='online', choices=['online', 'offline', 'disabled'])
+    parser.add_argument('--wandb_dir', type=str, default=None)
+    parser.add_argument('--wandb_source_run', type=str, default=None)
+    parser.add_argument('--wandb_source_artifact', type=str, default=None)
+    parser.add_argument('--wandb_artifact_name', type=str, default=None)
+    parser.add_argument('--wandb_artifact_aliases', type=str, default='latest,best')
 
     args = parser.parse_args()
+    if args.encoder_type == 'conformer' and args.hand_query:
+        parser.error('--encoder_type conformer is not supported with --hand_query in the first Conformer branch.')
+    wandb_run = init_wandb(args)
 
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    device = select_device()
 
     with open(args.lookup_table, 'rb') as f:
         vocab = pickle.load(f)
@@ -128,11 +204,14 @@ if __name__ == '__main__':
         emb_type=args.emb_type,
         emb_network=args.emb_network,
         channels=channels,
+        encoder_type=args.encoder_type,
+        conformer_kernel_size=args.conformer_kernel_size,
     )
     model = load_checkpoint(model, args.model_path, device).to(device)
     model.eval()
 
     shown = 0
+    preview_rows = []
     with torch.no_grad():
         for x, x_lengths, y, y_lengths, hand_regions, _ in dataloader:
             x = x.to(device)
@@ -162,12 +241,9 @@ if __name__ == '__main__':
             if output is None:
                 raise RuntimeError("Model returned both output and output_context as None.")
             
-            # output: (batch, seq_len, vocab)
-            pred_frame_ids = torch.argmax(output, dim=-1).cpu().numpy()
+            decoded_preds = decode_ctc_batch(output.transpose(0, 1), x_lengths, blank_idx)
 
-            for b in range(pred_frame_ids.shape[0]):
-                pred_ids = pred_frame_ids[b][:x_lengths[b]].tolist()
-                pred_ids = ctc_greedy_decode(pred_ids, blank_idx)
+            for b, pred_ids in enumerate(decoded_preds):
 
                 gt_ids = y[b][:y_lengths[b]].tolist()
 
@@ -177,10 +253,25 @@ if __name__ == '__main__':
                 if not pred_text:
                     pred_text = '[blank]'
 
+                preview_rows.append({
+                    'idx': shown,
+                    'ground_truth': gt_text,
+                    'prediction': pred_text,
+                    'exact_match': pred_text == gt_text,
+                    'is_blank': pred_text == '[blank]',
+                })
+
                 print(f'GT: {gt_text}')
                 print(f'PRED: {pred_text}')
                 print('-' * 60)
 
                 shown += 1
                 if shown >= args.num_examples:
+                    log_wandb_preview(wandb_run, args, preview_rows)
+                    if wandb_run is not None:
+                        wandb_run.finish()
                     raise SystemExit(0)
+
+    log_wandb_preview(wandb_run, args, preview_rows)
+    if wandb_run is not None:
+        wandb_run.finish()

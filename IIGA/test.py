@@ -11,6 +11,8 @@ import cv2
 
 from transformer import make_model as TRANSFORMER
 from dataloader import loader 
+from tools.ctc_decode import decode_ctc_batch, ids_to_text
+from tools.runtime import select_device
 from tools.utils import path_data, Batch
 
 #Progress bar to visualize training progress
@@ -25,8 +27,12 @@ from tools.rouge import rouge
 #Lavenshtein distance (WER)
 from jiwer import wer
 
-import tensorflow.compat.v1 as tf
-tf.enable_eager_execution()
+
+def load_checkpoint(model_path, map_location=None):
+    try:
+        return torch.load(model_path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(model_path, map_location=map_location)
 
 # parser helper for optional probabilities in [0, 1]
 def optional_probability(value):
@@ -45,8 +51,6 @@ def optional_probability(value):
         raise argparse.ArgumentTypeError("value must be between 0 and 1.")
 
     return prob
-
-
 ###
 # Arg parsing
 ##############
@@ -84,6 +88,9 @@ parser.add_argument('--num_layers', type=int, default=2,
 parser.add_argument('--n_heads', type=int, default=10,
                     help='number of self attention heads')
 
+parser.add_argument('--d_ff', type=int, default=2048,
+                    help='feed-forward hidden size inside transformer blocks')
+
 parser.add_argument('--rescale', type=int, default=224,
                     help='rescale data images. NOTE: use same image size as the training or else you get worse results.')
 
@@ -100,13 +107,13 @@ parser.add_argument('--show_sample', action='store_true',
 parser.add_argument('--batch_size', type=int, default=1,
                     help='size of one minibatch')
 
-parser.add_argument('--save', default='False',
+parser.add_argument('--save', action='store_true',
                     help='save the results of the evaluation')
 
 parser.add_argument('--hand_query', action='store_true',
                     help='Set hand cropped image as a query for transformer network.')
 
-parser.add_argument('--data_stats', type=str, default='data_stats.pt',
+parser.add_argument('--data_stats', type=str, default=None,
                     help='Normalize images using the dataset stats (mean/std).')
 
 parser.add_argument('--hand_stats', type=str, default=None,
@@ -121,6 +128,11 @@ parser.add_argument('--emb_type', type=str, default='2d',
 
 parser.add_argument('--emb_network', type=str, default='mb2',
                     help='Image embeddings network: mb2/mb2-ssd/rcnn')
+
+parser.add_argument('--encoder_type', type=str, default='legacy', choices=['legacy', 'conformer'],
+                    help='sequence encoder type; legacy preserves the original CSLR-IIGA encoder path')
+parser.add_argument('--conformer_kernel_size', type=int, default=17,
+                    help='depthwise convolution kernel size for --encoder_type conformer; must be odd')
 
 parser.add_argument('--decoding', type=str, default='greedy',
                     help='Decoding method (greedy/beam).')
@@ -154,6 +166,9 @@ print ("Start Time: "+start_date)
 
 args = parser.parse_args()
 
+if args.encoder_type == 'conformer' and args.hand_query:
+    parser.error('--encoder_type conformer is not supported with --hand_query in the first Conformer branch.')
+
 #Set the random seed manually for reproducibility.
 torch.manual_seed(args.seed)
 
@@ -183,7 +198,11 @@ train_path, valid_path, test_path = path_data(data_path=args.data, task='SLR', h
 
 #Load stats
 if(args.data_stats):
-    args.data_stats = torch.load(args.data_stats, map_location=torch.device('cpu'))
+    if os.path.exists(args.data_stats):
+        args.data_stats = torch.load(args.data_stats, map_location=torch.device('cpu'))
+    else:
+        print(f"WARNING: data_stats file not found at {args.data_stats}. Continuing without full-frame normalization.")
+        args.data_stats = None
 
 if(args.hand_query and args.hand_stats):
     if os.path.exists(args.hand_stats):
@@ -246,6 +265,8 @@ with open(args.lookup_table, 'rb') as pickle_file:
    vocab = pickle.load(pickle_file)
 
 vocab_size = len(vocab)
+pad_index = vocab.get('<PAD>', 0)
+blank_index = vocab.get('<BLANK>', vocab_size - 1)
 
 #Switch keys and values of vocab to easily look for words
 vocab = {y:x for x,y in vocab.items()}
@@ -256,9 +277,6 @@ print('vocabulary size:' + str(vocab_size))
 dataloaders = [valid_dataloader, test_dataloader]
 sizes = [valid_size, test_size]
 dataset = ['valid', 'test']
-
-#Blank token index
-blank_index = 1232
 
 #-------------------------------------------------------------------------------
 
@@ -294,15 +312,7 @@ if(args.txt):
 #-------------------------------------------------------------------------------
 
 
-#Run on GPU
-if torch.cuda.is_available():
-    print("Using GPU")
-    device = torch.device("cuda:0")
-else:
-#Run on CPU
-    print("WARNING: You are about to run on cpu, and this will likely run out \
-      of memory. \n You can try setting batch_size=1 to reduce memory usage")
-    device = torch.device("cpu")
+device = select_device(verbose=True, context="Evaluation")
 
 
 #-------------------------------------------------------------------------------
@@ -310,9 +320,12 @@ else:
 
 #Load the whole model with state dict
 model = TRANSFORMER(tgt_vocab=vocab_size, n_stacks=args.num_layers, n_units=args.hidden_size,
-                            n_heads=args.n_heads, window_size=args.local_window, d_ff=2048, dropout=1-args.dp_keep_prob, image_size=224,
-                                                       emb_type='2d', emb_network=args.emb_network)
-model.load_state_dict(torch.load(args.model_path)['model_state_dict'])
+                            n_heads=args.n_heads, window_size=args.local_window, d_ff=args.d_ff, dropout=1-args.dp_keep_prob, image_size=224,
+                                                       emb_type='2d', emb_network=args.emb_network,
+                                                       encoder_type=args.encoder_type,
+                                                       conformer_kernel_size=args.conformer_kernel_size)
+checkpoint = load_checkpoint(args.model_path, map_location=device)
+model.load_state_dict(checkpoint['model_state_dict'])
 #model.load_state_dict(torch.load(args.model_path)['model_state_dict'])
 
 #Load entire model w/ weights
@@ -432,25 +445,15 @@ for d in range(len(sizes)):
         x_lengths = torch.IntTensor(x_lengths)
         y_lengths = torch.IntTensor(y_lengths)
 
-        decodes, _ = tf.nn.ctc_beam_search_decoder(inputs=output.cpu().detach().numpy(),
-                            sequence_length=x_lengths.cpu().detach().numpy(), merge_repeated=False, beam_width=10, top_paths=1)
-
-        pred = decodes[0]
-
-        pred = tf.sparse.to_dense(pred).numpy()
+        decoded_preds = decode_ctc_batch(output, x_lengths, blank_index)
 
         #Loop over translations and references
-        for j in range(len(y)):
+        for j, p in enumerate(decoded_preds):
 
             ys = y[j, :y_lengths[j]]
-            p = pred[j]
 
-            #Remove <UNK> token
-            p = p[p != 0]
-            ys = ys[ys != 0]
-
-            hyp = (' '.join([vocab[x.item()] for x in p]))
-            gt = (' '.join([vocab[x.item()] for x in ys]))
+            hyp = ids_to_text(p, vocab, ignore_ids=[blank_index, pad_index])
+            gt = ids_to_text(ys.tolist(), vocab, ignore_ids=[blank_index, pad_index])
 
             total_wer_score += wer(gt, hyp)
             count += 1
@@ -480,18 +483,18 @@ for d in range(len(sizes)):
         #Default return
         #NOTE: bleu score of camgoz results is slightly better than ntlk -> use it instead
         #bleu_4 = corpus_bleu(reference_corpus, translation_corpus)
-        bleu_4, _, _, _, _, _ = compute_bleu(references_corpus, translation_corpus, max_order=4)
+        bleu_4, _, _, _, _, _ = compute_bleu(reference_corpus, translation_corpus, max_order=4)
 
         #weights = (1.0/1.0, )
-        bleu_1, _, _, _, _, _ = compute_bleu(references_corpus, translation_corpus, max_order=1)
+        bleu_1, _, _, _, _, _ = compute_bleu(reference_corpus, translation_corpus, max_order=1)
 
         #weights = (1.0/2.0, 1.0/2.0, )
         #bleu_2 = corpus_bleu(reference_corpus, translation_corpus, weights)
-        bleu_2, _, _, _, _, _ = compute_bleu(references_corpus, translation_corpus, max_order=2)
+        bleu_2, _, _, _, _, _ = compute_bleu(reference_corpus, translation_corpus, max_order=2)
 
         #weights = (1.0/3.0, 1.0/3.0, 1.0/3.0,)
         #bleu_3 = corpus_bleu(reference_corpus, translation_corpus, weights)
-        bleu_3, _, _, _, _, _ = compute_bleu(references_corpus, translation_corpus, max_order=3)
+        bleu_3, _, _, _, _, _ = compute_bleu(reference_corpus, translation_corpus, max_order=3)
 
         log_str = 'Bleu Evaluation: ' + '\t' \
         + 'Bleu_1: ' + str(bleu_1) + '\t' \

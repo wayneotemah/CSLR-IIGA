@@ -13,6 +13,8 @@ from torchvision import transforms
 
 from transformer import make_model as TRANSFORMER
 from dataloader import loader #For SLR
+from tools.ctc_decode import decode_ctc_batch, ids_to_text
+from tools.runtime import select_device
 from tools.utils import Batch
 
 
@@ -23,9 +25,12 @@ from tools.rouge import rouge
 #Lavenshtein distance (WER)
 from jiwer import wer
 
-import tensorflow.compat.v1 as tf
-tf.enable_eager_execution()
 
+def load_checkpoint(model_path, map_location=None):
+    try:
+        return torch.load(model_path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(model_path, map_location=map_location)
 
 ###
 # Arg parsing
@@ -37,7 +42,7 @@ parser.add_argument('--data', type=str, default=os.path.join('home','artaheri.sh
                     help='location of the video')
 
 
-parser.add_argument('--idx', type=int, default='',
+parser.add_argument('--idx', type=int, default=0,
                     help='index of the video')
 
 parser.add_argument('--model_path', type=str, default=os.path.join("EXPERIMENTATIONS"),
@@ -48,6 +53,18 @@ parser.add_argument('--csv_path', type=str, default='',
 
 parser.add_argument('--lookup_table', type=str, default=os.path.join('home','artaheri.sharif','SLR_lookup_pickle.txt'),
                     help='location of the words lookup table')
+
+parser.add_argument('--hidden_size', type=int, default=1280,
+                    help='size of hidden layers. NOTE: This must be a multiple of n_heads.')
+
+parser.add_argument('--num_layers', type=int, default=2,
+                    help='number of transformer blocks')
+
+parser.add_argument('--n_heads', type=int, default=10,
+                    help='number of self attention heads')
+
+parser.add_argument('--d_ff', type=int, default=2048,
+                    help='feed-forward hidden size inside transformer blocks')
 
 
 parser.add_argument('--rescale', type=int, default=224,
@@ -72,6 +89,11 @@ parser.add_argument('--emb_type', type=str, default='2d',
 
 parser.add_argument('--emb_network', type=str, default='mb2',
                     help='Image embeddings network: mb2/mb2-ssd/rcnn')
+
+parser.add_argument('--encoder_type', type=str, default='legacy', choices=['legacy', 'conformer'],
+                    help='sequence encoder type; legacy preserves the original CSLR-IIGA encoder path')
+parser.add_argument('--conformer_kernel_size', type=int, default=17,
+                    help='depthwise convolution kernel size for --encoder_type conformer; must be odd')
 
 parser.add_argument('--decoding', type=str, default='greedy',
                     help='Decoding method (greedy/beam).')
@@ -102,6 +124,9 @@ print ("Start Time: "+start_date)
 
 args = parser.parse_args()
 
+if args.encoder_type == 'conformer' and args.hand_query:
+    parser.error('--encoder_type conformer is not supported with --hand_query in the first Conformer branch.')
+
 #Set the random seed manually for reproducibility.
 torch.manual_seed(args.seed)
 
@@ -131,6 +156,9 @@ with open(args.lookup_table, 'rb') as pickle_file:
    vocab = pickle.load(pickle_file)
 
 vocab_size = len(vocab)
+pad_index = vocab.get('<PAD>', 0)
+unk_index = vocab.get('<UNK>', 3)
+blank_index = vocab.get('<BLANK>', vocab_size - 1)
 
 #Switch keys and values of vocab to easily look for words
 vocab = {y:x for x,y in vocab.items()}
@@ -138,34 +166,25 @@ vocab = {y:x for x,y in vocab.items()}
 print('vocabulary size:' + str(vocab_size))
 
 
-#Blank token index
-blank_index = 1232
-
-
 #-------------------------------------------------------------------------------
 
 
-#Run on GPU
-if torch.cuda.is_available():
-    print("Using GPU")
-    print('Device name:{}',torch.cuda.get_device_name(0))
-    device = torch.device("cuda:0")
-else:
-#Run on CPU
-    print("WARNING: You are about to run on cpu, and this will likely run out \
-      of memory. \n You can try setting batch_size=1 to reduce memory usage")
-    device = torch.device("cpu")
+device = select_device(verbose=True, context="Prediction")
 
 
 #-------------------------------------------------------------------------------
 
 
 #Load the whole model with state dict
-model = TRANSFORMER(tgt_vocab=vocab_size, n_stacks=2, n_units=1280,
-                            n_heads=10, d_ff=2048, dropout=0.3, image_size=224,
-                                                       emb_type='2d', emb_network='mb2')
+model = TRANSFORMER(tgt_vocab=vocab_size,
+                            n_stacks=args.num_layers, n_units=args.hidden_size,
+                            n_heads=args.n_heads, d_ff=args.d_ff, dropout=0.3, image_size=224,
+                                                       emb_type='2d', emb_network='mb2',
+                                                       encoder_type=args.encoder_type,
+                                                       conformer_kernel_size=args.conformer_kernel_size)
 #model.load_state_dict(torch.load(args.model_path))
-model.load_state_dict(torch.load(args.model_path)['model_state_dict'])
+checkpoint = load_checkpoint(args.model_path, map_location=device)
+model.load_state_dict(checkpoint['model_state_dict'])
 
 #Load entire model w/ weights
 #model = torch.load(args.model_path, map_location=device)
@@ -222,7 +241,7 @@ for word in translation:
         tran.append(lookup_table[word])
     else:
         #If words doesnt exist in train vocab then <unk>
-        tran.append(0)
+        tran.append(unk_index)
 x=torch.tensor(trsf_images)
 x_lengths=[np.shape(trsf_images)[0]]
 y=tran
@@ -272,25 +291,15 @@ _, pred = torch.max(output, dim=-1)
 x_lengths = torch.IntTensor(x_lengths)
 y_lengths = torch.IntTensor(y_lengths)
 
-decodes, _ = tf.nn.ctc_beam_search_decoder(inputs=output.cpu().detach().numpy(),
-                    sequence_length=x_lengths.cpu().detach().numpy(), merge_repeated=False, beam_width=10, top_paths=1)
-
-pred = decodes[0]
-
-pred = tf.sparse.to_dense(pred).numpy()
+decoded_preds = decode_ctc_batch(output, x_lengths, blank_index)
 
 #Loop over translations and references
-for j in range(len(y)):
+for j, p in enumerate(decoded_preds):
 
     ys = y[j, :y_lengths[j]]
-    p = pred[j]
 
-    #Remove <UNK> token
-    p = p[p != 0]
-    ys = ys[ys != 0]
-
-    hyp = (' '.join([vocab[x.item()] for x in p]))
-    gt = (' '.join([vocab[x.item()] for x in ys]))
+    hyp = ids_to_text(p, vocab, ignore_ids=[blank_index, pad_index])
+    gt = ids_to_text(ys.tolist(), vocab, ignore_ids=[blank_index, pad_index])
 
     total_wer_score += wer(gt, hyp)
     count += 1

@@ -505,9 +505,9 @@ class LocalMaskedMHCA(nn.Module):
         k = k.view(B, self.n_head, self.n_channels, -1).transpose(2, 3)
         v = v.view(B, self.n_head, self.n_channels, -1).transpose(2, 3)
         # view as (B * nh, T, hs)
-        q = q.view(B * self.n_head, -1, self.n_channels).contiguous()
-        k = k.view(B * self.n_head, -1, self.n_channels).contiguous()
-        v = v.view(B * self.n_head, -1, self.n_channels).contiguous()
+        q = q.reshape(B * self.n_head, -1, self.n_channels).contiguous()
+        k = k.reshape(B * self.n_head, -1, self.n_channels).contiguous()
+        v = v.reshape(B * self.n_head, -1, self.n_channels).contiguous()
 
         # step 3: compute local self-attention with rel pe and masking
         q *= self.scale
@@ -846,17 +846,29 @@ class Encoder(nn.Module):
         self.layers = clones(layer, N)
         self.norm = LayerNormalization(layer.size)
 
-    def forward(self, x, hand_emb, mask):
+    def forward(self, x, hand_emb, mask, return_intermediate=False, intermediate_layer=None):
 
         #Pass the input (and mask) through each layer in turn.
+        intermediate = None
+        if intermediate_layer is None:
+            intermediate_layer = max(0, len(self.layers) // 2 - 1)
+
         for i in range(0, len(self.layers)):
             x = self.layers[i](x, mask, hand_emb)
+
+            if return_intermediate and i == intermediate_layer:
+                intermediate = self.norm(x)
 
             if(type(hand_emb) != type(None)):
                 break
 
         #(batch, seq, n_units)
-        return self.norm(x)
+        x = self.norm(x)
+        if return_intermediate:
+            if intermediate is None:
+                intermediate = x
+            return x, intermediate
+        return x
 ##########
 
 #Produce the output probablitites
@@ -879,6 +891,8 @@ class FullTransformer(nn.Module):
         self.encoder = encoder
         self.src_emb = src_emb
         self.output_layer = output
+        self.interctc_output_layer = copy.deepcopy(output)
+        self.visual_ctc_output_layer = copy.deepcopy(output)
         self.hand_emb = HandExtractor()
         self.position = position
         self.window_size = window_size
@@ -901,11 +915,11 @@ class FullTransformer(nn.Module):
     def activations_hook(self, grad):
         self.gradients = grad
 
-    def encode(self, src_emb, hand_emb, src_mask):
-        return self.encoder(src_emb, hand_emb, src_mask)
+    def encode(self, src_emb, hand_emb, src_mask, return_intermediate=False, intermediate_layer=None):
+        return self.encoder(src_emb, hand_emb, src_mask, return_intermediate=return_intermediate, intermediate_layer=intermediate_layer)
 
     #Call this when training
-    def forward(self, src, src_mask, rel_mask=None, hand_seqs=None, arch='CNN-attention-CTC'):
+    def forward(self, src, src_mask, rel_mask=None, hand_seqs=None, arch='CNN-attention-CTC', return_intermediate_ctc=False, intermediate_ctc_layer=None, return_visual_ctc=False):
         
         #Use normal mask
         if(type(rel_mask) == type(None)):
@@ -931,11 +945,21 @@ class FullTransformer(nn.Module):
             
             src_mask = torch.nn.functional.pad(src_mask,(0,m),mode='constant',value=0)
 
+        intermediate_out = None
+        visual_ctc_out = None
+
         if(arch=='CNN-attention-CTC'):
             #(batch, seq_length, feature_dim)
             #src_emb = self.position(src_emb)
-            
-            src_emb = self.encode(src_emb, None, src_mask)
+
+            if return_visual_ctc:
+                visual_ctc_out = self.visual_ctc_output_layer(src_emb)
+
+            if return_intermediate_ctc:
+                src_emb, intermediate_emb = self.encode(src_emb, None, src_mask, return_intermediate=True, intermediate_layer=intermediate_ctc_layer)
+                intermediate_out = self.interctc_output_layer(intermediate_emb)
+            else:
+                src_emb = self.encode(src_emb, None, src_mask)
 
         full_out = self.output_layer(src_emb)
 
@@ -960,11 +984,104 @@ class FullTransformer(nn.Module):
             comb_out = None
             hand_out = None
 
+        if return_intermediate_ctc:
+            if return_visual_ctc:
+                return comb_out, full_out, hand_out, intermediate_out, visual_ctc_out
+            return comb_out, full_out, hand_out, intermediate_out
+
+        if return_visual_ctc:
+            return comb_out, full_out, hand_out, visual_ctc_out
+
         return comb_out, full_out, hand_out
 
 
 #Create the full model
-def make_model(tgt_vocab, n_stacks=2, n_units=512, n_heads=10, window_size=10 , d_ff=2048, dropout=0.3, image_size=224, pretrained=True, emb_type='2d', emb_network='mb2', full_pretrained=None, hand_pretrained=None, freeze_cnn=False, channels=3):
+class ConformerFeedForward(nn.Module):
+    def __init__(self, n_units, d_ff, dropout=0.1):
+        super().__init__()
+        self.norm = LayerNormalization(n_units)
+        self.w_1 = nn.Linear(n_units, d_ff)
+        self.w_2 = nn.Linear(d_ff, n_units)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        x = self.norm(x)
+        x = self.w_1(x)
+        x = F.silu(x)
+        x = self.dropout(x)
+        x = self.w_2(x)
+        return self.dropout(x)
+
+
+class ConformerConvolution(nn.Module):
+    def __init__(self, n_units, kernel_size=17, dropout=0.1):
+        super().__init__()
+        if kernel_size % 2 == 0:
+            raise ValueError('conformer_kernel_size must be odd for same-length convolution')
+        self.norm = LayerNormalization(n_units)
+        self.pointwise_in = nn.Conv1d(n_units, n_units * 2, kernel_size=1)
+        self.depthwise = nn.Conv1d(
+            n_units,
+            n_units,
+            kernel_size=kernel_size,
+            padding=kernel_size // 2,
+            groups=n_units,
+        )
+        self.batch_norm = nn.BatchNorm1d(n_units)
+        self.pointwise_out = nn.Conv1d(n_units, n_units, kernel_size=1)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        x = self.norm(x).transpose(1, 2)
+        x = self.pointwise_in(x)
+        x = F.glu(x, dim=1)
+        x = self.depthwise(x)
+        x = self.batch_norm(x)
+        x = F.silu(x)
+        x = self.pointwise_out(x)
+        x = self.dropout(x)
+        return x.transpose(1, 2)
+
+
+class ConformerEncoderLayer(nn.Module):
+    def __init__(self, n_units, n_heads, d_ff, dropout=0.1, kernel_size=17):
+        super().__init__()
+        self.size = n_units
+        self.ffn_1 = ConformerFeedForward(n_units, d_ff, dropout)
+        self.self_attn_norm = LayerNormalization(n_units)
+        self.self_attn = nn.MultiheadAttention(n_units, n_heads, dropout=dropout, batch_first=True)
+        self.self_attn_dropout = nn.Dropout(dropout)
+        self.conv = ConformerConvolution(n_units, kernel_size, dropout)
+        self.ffn_2 = ConformerFeedForward(n_units, d_ff, dropout)
+        self.final_norm = LayerNormalization(n_units)
+
+    @staticmethod
+    def _key_padding_mask(mask):
+        if mask is None:
+            return None
+        if mask.dim() == 3:
+            mask = mask.squeeze(1)
+        return ~mask.bool()
+
+    def forward(self, x, mask=None, hand_emb=None):
+        if hand_emb is not None:
+            raise NotImplementedError('Conformer encoder is not supported with hand_query')
+        x = x + 0.5 * self.ffn_1(x)
+        attn_in = self.self_attn_norm(x)
+        attn_out, _ = self.self_attn(
+            attn_in,
+            attn_in,
+            attn_in,
+            key_padding_mask=self._key_padding_mask(mask),
+            need_weights=False,
+        )
+        x = x + self.self_attn_dropout(attn_out)
+        x = x + self.conv(x)
+        x = x + 0.5 * self.ffn_2(x)
+        return self.final_norm(x)
+
+
+def make_model(tgt_vocab, n_stacks=2, n_units=512, n_heads=10, window_size=10 , d_ff=2048, dropout=0.3, image_size=224, pretrained=True, emb_type='2d', emb_network='mb2', full_pretrained=None, hand_pretrained=None, freeze_cnn=False, channels=3, encoder_type='legacy', conformer_kernel_size=17):
 
     c = copy.deepcopy
     #attn = MultiHeadedAttention(n_heads, n_units, dropout)
@@ -973,8 +1090,15 @@ def make_model(tgt_vocab, n_stacks=2, n_units=512, n_heads=10, window_size=10 , 
     ff = PositionWise(n_units, d_ff, dropout)
     position = PositionalEncoding(n_units, dropout)
 
+    if encoder_type == 'legacy':
+        encoder = Encoder(EncoderStack(n_units, c(attn), c(ff), c(seg_att), dropout, window_size), 2)
+    elif encoder_type == 'conformer':
+        encoder = Encoder(ConformerEncoderLayer(n_units, n_heads, d_ff, dropout, conformer_kernel_size), n_stacks)
+    else:
+        raise ValueError(f'Unknown encoder_type: {encoder_type}')
+
     model = FullTransformer(window_size,
-        Encoder( EncoderStack(n_units, c(attn), c(ff), c(seg_att), dropout, window_size),2),
+        encoder,
         src_2Dembeddings(n_units, pretrained, image_size, network_type=emb_network, channels=channels),
         Output_layer(n_units, tgt_vocab),
         c(position)
@@ -1093,5 +1217,3 @@ class PositionWise(nn.Module):
     def forward(self, x):
         return self.w_2(self.dropout(F.relu(self.w_1(x))))
         #return self.w_2(self.dropout(self.activation(self.w_1(x))))
-
-
