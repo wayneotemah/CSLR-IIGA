@@ -545,6 +545,12 @@ parser.add_argument('--anchor_ce_weight', type=float, default=0.0,
 parser.add_argument('--anchor_audit_json', type=str, default=None,
                     help='Path to a train-only anchor audit JSON used when --anchor_ce_weight is enabled.')
 
+parser.add_argument('--anchor_log_every_step', action='store_true',
+                    help='Log anchor CE visibility on every step when anchor CE is enabled. Intended for tiny debug/smoke runs.')
+
+parser.add_argument('--anchor_debug_sample_ids', type=str, default=None,
+                    help='Comma-separated sample IDs to log when they appear in training batches during anchor CE debugging.')
+
 
 #----------------------------------------------------------------------------------------
 
@@ -652,6 +658,12 @@ def run_epoch(model, data, is_train=False, device=None, n_devices=1):
 
     gt = []
     hyp = []
+
+    anchor_debug_target_ids = set()
+    if args.anchor_debug_sample_ids:
+        anchor_debug_target_ids = {
+            sample_id.strip() for sample_id in args.anchor_debug_sample_ids.split(',') if sample_id.strip()
+        }
 
     # Progress bars redraw repeatedly and flood persistent logs when output is captured
     # through Jupyter/tee. Keep epoch summaries as the default and make bars opt-in.
@@ -862,7 +874,29 @@ def run_epoch(model, data, is_train=False, device=None, n_devices=1):
 
         last_anchor_ce = None
         last_anchor_count = 0
+        anchor_debug_hits = []
         if is_train and args.anchor_ce_weight > 0.0:
+            if sample_ids is not None and anchor_debug_target_ids:
+                debug_raw_lengths = [int(length) for length in raw_x_lengths]
+                for batch_idx, sample_id in enumerate(sample_ids):
+                    sample_id_str = str(sample_id)
+                    if sample_id_str not in anchor_debug_target_ids:
+                        continue
+                    sample_anchor_pairs = anchor_map_by_sample_id.get(sample_id_str, [])
+                    raw_length = debug_raw_lengths[batch_idx]
+                    max_time = output_context.size(1)
+                    valid_time = min(raw_length, max_time)
+                    in_bounds = [pair for pair in sample_anchor_pairs if pair[0] < valid_time]
+                    out_of_bounds = [pair for pair in sample_anchor_pairs if pair[0] >= valid_time]
+                    anchor_debug_hits.append({
+                        'sample_id': sample_id_str,
+                        'raw_length': raw_length,
+                        'valid_time': valid_time,
+                        'anchor_count': len(sample_anchor_pairs),
+                        'in_bounds_anchor_count': len(in_bounds),
+                        'out_of_bounds_anchor_count': len(out_of_bounds),
+                        'anchors': sample_anchor_pairs,
+                    })
             anchor_ce, anchor_count = compute_anchor_ce(output_context, sample_ids, raw_x_lengths, anchor_map_by_sample_id)
             if anchor_count > 0 and torch.isfinite(anchor_ce):
                 loss = loss + args.anchor_ce_weight * anchor_ce
@@ -884,7 +918,9 @@ def run_epoch(model, data, is_train=False, device=None, n_devices=1):
 
             optimizer.step()
 
-            if step % 100 == 0:
+            should_log_anchor_step = args.anchor_ce_weight > 0.0 and args.anchor_log_every_step
+
+            if step % 100 == 0 or should_log_anchor_step:
                 elapsed = time.time() - start_time
                 telemetry = format_device_telemetry(telemetry_poller.sample())
                 print("Step: %d, Loss: %f, Frame per Sec: %f, Token per sec: %f"%
@@ -894,6 +930,8 @@ def run_epoch(model, data, is_train=False, device=None, n_devices=1):
                         print("Anchor CE: skipped, Anchors: 0")
                     else:
                         print("Anchor CE: %.6f, Anchors: %d" % (last_anchor_ce, last_anchor_count))
+                    if anchor_debug_hits:
+                        print("Anchor debug hits: " + json.dumps(anchor_debug_hits, sort_keys=True))
                 if telemetry:
                     print(f"Telemetry: {telemetry}")
 
