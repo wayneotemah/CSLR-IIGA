@@ -33,6 +33,7 @@ def load_checkpoint(model: torch.nn.Module, model_path: str | Path, device: torc
 
 
 def normalize_target_ids(target_tensor: torch.Tensor, target_length: int, pad_idx: int, blank_idx: int) -> list[int]:
+    target_tensor = torch.as_tensor(target_tensor)
     target_ids = []
     for raw in target_tensor[:target_length].tolist():
         token_id = int(raw)
@@ -106,7 +107,11 @@ def build_bank(args: argparse.Namespace) -> dict[str, object]:
         for batch in dataloader:
             x, x_lengths, y, y_lengths, hand_regions, _, sample_ids = batch
             x = x.to(device)
+            input_lengths = torch.as_tensor(x_lengths, dtype=torch.long)
+            target_batch = torch.as_tensor(y)
+            target_lengths = torch.as_tensor(y_lengths, dtype=torch.long)
             batch_obj = Batch(x_lengths, y_lengths, None, trg=None, pad=pad_idx, DEVICE=device, emb_type=args.emb_type)
+            src_emb, _, _ = model.src_emb(x)
             out = model.forward(x, batch_obj.src_mask, batch_obj.rel_mask, None)
             if isinstance(out, tuple):
                 output, output_context, _ = out[:3]
@@ -117,20 +122,20 @@ def build_bank(args: argparse.Namespace) -> dict[str, object]:
                 raise RuntimeError('Model returned no CTC logits')
 
             batch_log_probs = log_probs_batch.transpose(0, 1).detach().cpu()
-            sequence_embeddings = model.src_emb.detach().cpu()
+            sequence_embeddings = src_emb.detach().cpu()
             alignments = batch_ctc_forced_align(
                 batch_log_probs,
-                x_lengths,
-                y.detach().cpu(),
-                y_lengths,
+                input_lengths,
+                target_batch,
+                target_lengths,
                 blank_idx=blank_idx,
                 already_log_probs=True,
             )
 
             for batch_idx, alignment in enumerate(alignments):
                 sample_id = str(sample_ids[batch_idx])
-                target_length = int(y_lengths[batch_idx].item() if hasattr(y_lengths[batch_idx], 'item') else y_lengths[batch_idx])
-                target_ids = normalize_target_ids(y[batch_idx].detach().cpu(), target_length, pad_idx, blank_idx)
+                target_length = int(target_lengths[batch_idx].item())
+                target_ids = normalize_target_ids(target_batch[batch_idx], target_length, pad_idx, blank_idx)
                 target_spans = alignment.get('token_spans', [])
 
                 span_cursor = 0
