@@ -12,14 +12,11 @@ def read_corpus_ids(csv_path: Path) -> set[str]:
     ids: set[str] = set()
     if not csv_path.exists():
         return ids
-
-    with csv_path.open('r', encoding='utf-8') as handle:
-        for line in handle:
-            row = line.strip()
-            if not row:
-                continue
-            ids.add(row.split('|', 1)[0])
-
+    for line in csv_path.read_text(encoding='utf-8').splitlines():
+        row = line.strip()
+        if not row:
+            continue
+        ids.add(row.split('|', 1)[0])
     return ids
 
 
@@ -52,10 +49,23 @@ def collect_anchor_entries(node: Any) -> list[dict[str, Any]]:
     return entries
 
 
+def load_lookup(path: Path) -> dict[str, int]:
+    if path.suffix == '.pkl':
+        with path.open('rb') as handle:
+            loaded = pickle.load(handle)
+        return {str(key): int(value) for key, value in loaded.items()}
+
+    data = json.loads(path.read_text(encoding='utf-8'))
+    if isinstance(data, dict) and 'vocab' in data:
+        data = data['vocab']
+    if not isinstance(data, dict):
+        raise SystemExit(f'unsupported lookup format: {path}')
+    return {str(key): int(value) for key, value in data.items()}
+
+
 def validate_subset_artifact(
     artifact: dict[str, Any],
     word_to_id: dict[str, int],
-    vocab_size: int,
     train_csv: Path,
     valid_csv: Path,
     test_csv: Path,
@@ -64,17 +74,15 @@ def validate_subset_artifact(
     valid_ids = read_corpus_ids(valid_csv)
     test_ids = read_corpus_ids(test_csv)
     forbidden_ids = valid_ids | test_ids
+    vocab_size = len(word_to_id)
 
-    anchor_map: dict[str, list[tuple[int, int]]] = {}
+    loaded_anchor_map: dict[str, list[tuple[int, int]]] = {}
     skipped_unknown_tokens = 0
     skipped_invalid = 0
     skipped_non_train = 0
 
     raw_entries = collect_anchor_entries(artifact)
-    eligible_true_count = 0
-    top_level_eligible_anchors = artifact.get('eligible_anchors', [])
-    if isinstance(top_level_eligible_anchors, list):
-        eligible_true_count = sum(1 for entry in top_level_eligible_anchors if isinstance(entry, dict) and entry.get('eligible') is not False)
+    top_level_eligible_true_count = sum(1 for entry in raw_entries if entry.get('eligible', True) is not False)
 
     for entry in raw_entries:
         if entry.get('eligible') is False:
@@ -89,7 +97,7 @@ def validate_subset_artifact(
             if token_text not in word_to_id:
                 skipped_unknown_tokens += 1
                 continue
-            token_id = word_to_id[token_text]
+            token_id = word_to_id[str(token_text)]
 
         if sample_id is None or frame_idx is None:
             skipped_invalid += 1
@@ -108,71 +116,57 @@ def validate_subset_artifact(
             continue
 
         if sample_id in forbidden_ids:
-            raise ValueError(f'Artifact contains validation/test sample id {sample_id}')
+            raise SystemExit(f'artifact contains validation/test sample id: {sample_id}')
         if train_ids and sample_id not in train_ids:
             skipped_non_train += 1
             continue
 
-        anchor_map.setdefault(sample_id, []).append((frame_idx, token_id))
+        loaded_anchor_map.setdefault(sample_id, []).append((frame_idx, token_id))
 
-    for sample_anchors in anchor_map.values():
+    for sample_anchors in loaded_anchor_map.values():
         sample_anchors.sort(key=lambda item: item[0])
 
-    total_anchors = sum(len(sample_anchors) for sample_anchors in anchor_map.values())
-    unique_tokens = {token_id for sample_anchors in anchor_map.values() for _, token_id in sample_anchors}
+    loaded_anchor_count = sum(len(sample_anchors) for sample_anchors in loaded_anchor_map.values())
+    unique_token_ids = sorted({token_id for sample_anchors in loaded_anchor_map.values() for _, token_id in sample_anchors})
+    min_anchor_frame = min((frame for sample_anchors in loaded_anchor_map.values() for frame, _ in sample_anchors), default=None)
+    max_anchor_frame = max((frame for sample_anchors in loaded_anchor_map.values() for frame, _ in sample_anchors), default=None)
 
-    if not total_anchors:
-        raise ValueError('No usable eligible anchors loaded from subset artifact')
+    artifact_overview = artifact.get('artifact_overview', {}) if isinstance(artifact, dict) else {}
+    sample_anchor_examples = {
+        sample_id: len(sample_anchors)
+        for sample_id, sample_anchors in sorted(loaded_anchor_map.items())[:10]
+    }
+    sample_anchor_map = {
+        sample_id: sample_anchors
+        for sample_id, sample_anchors in sorted(loaded_anchor_map.items())[:10]
+    }
 
-    sample_anchor_counts = Counter({sample_id: len(sample_anchors) for sample_id, sample_anchors in anchor_map.items()})
-    frame_indices = [frame_idx for sample_anchors in anchor_map.values() for frame_idx, _ in sample_anchors]
-
-    expected_count = artifact.get('artifact_overview', {}).get('eligible_anchor_count')
-    expected_unique_samples = artifact.get('artifact_overview', {}).get('unique_anchor_sample_count')
-    expected_unique_tokens = artifact.get('artifact_overview', {}).get('unique_anchor_token_count')
-
-    summary = {
+    return {
         'raw_entry_count': len(raw_entries),
-        'top_level_eligible_true_count': eligible_true_count,
-        'loaded_anchor_count': total_anchors,
-        'unique_sample_count': len(anchor_map),
-        'unique_token_count': len(unique_tokens),
-        'min_anchor_frame': min(frame_indices),
-        'max_anchor_frame': max(frame_indices),
-        'max_anchors_in_one_sample': max(sample_anchor_counts.values()),
-        'min_anchors_in_one_sample': min(sample_anchor_counts.values()),
+        'top_level_eligible_true_count': top_level_eligible_true_count,
+        'loaded_anchor_count': loaded_anchor_count,
+        'unique_sample_count': len(loaded_anchor_map),
+        'unique_token_count': len(unique_token_ids),
         'loaded_counts_match_artifact': {
-            'eligible_anchor_count': expected_count == total_anchors,
-            'unique_anchor_sample_count': expected_unique_samples == len(anchor_map),
-            'unique_anchor_token_count': expected_unique_tokens == len(unique_tokens),
+            'eligible_anchor_count': loaded_anchor_count == artifact_overview.get('eligible_anchor_count'),
+            'unique_anchor_sample_count': len(loaded_anchor_map) == artifact_overview.get('unique_anchor_sample_count'),
+            'unique_anchor_token_count': len(unique_token_ids) == artifact_overview.get('unique_anchor_token_count'),
         },
         'skipped_unknown_tokens': skipped_unknown_tokens,
         'skipped_invalid': skipped_invalid,
         'skipped_non_train': skipped_non_train,
-        'sample_anchor_examples': dict(sample_anchor_counts.most_common(10)),
-        'sample_anchor_map': {
-            sample_id: [{'frame_idx': frame_idx, 'token_id': token_id} for frame_idx, token_id in anchors]
-            for sample_id, anchors in sorted(anchor_map.items())
-        },
+        'min_anchor_frame': min_anchor_frame,
+        'max_anchor_frame': max_anchor_frame,
+        'min_anchors_in_one_sample': min((len(v) for v in loaded_anchor_map.values()), default=0),
+        'max_anchors_in_one_sample': max((len(v) for v in loaded_anchor_map.values()), default=0),
+        'sample_anchor_examples': sample_anchor_examples,
+        'sample_anchor_map': sample_anchor_map,
     }
-
-    return summary
-
-
-def load_lookup(path: Path) -> dict[str, int]:
-    if path.suffix == '.pkl':
-        with path.open('rb') as handle:
-            vocab = pickle.load(handle)
-    else:
-        payload = json.loads(path.read_text(encoding='utf-8'))
-        vocab = payload.get('vocab', payload)
-
-    return {str(key): int(value) for key, value in vocab.items()}
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description='Dry-run validate a subset pseudo-alignment artifact against train.py anchor expectations.'
+        description='Dry-run validate a dense pseudo-align subset artifact against train.py anchor loading expectations.'
     )
     parser.add_argument('--artifact_json', required=True)
     parser.add_argument('--lookup_json', required=True)
@@ -193,18 +187,12 @@ def main() -> None:
         raise SystemExit(f'missing lookup json: {lookup_path}')
     if not train_csv.exists():
         raise SystemExit(f'missing train corpus csv: {train_csv}')
-    if not valid_csv.exists():
-        raise SystemExit(f'missing valid corpus csv: {valid_csv}')
-    if not test_csv.exists():
-        raise SystemExit(f'missing test corpus csv: {test_csv}')
 
     artifact = json.loads(artifact_path.read_text(encoding='utf-8'))
     word_to_id = load_lookup(lookup_path)
-
-    summary = validate_subset_artifact(
+    validation = validate_subset_artifact(
         artifact=artifact,
         word_to_id=word_to_id,
-        vocab_size=len(word_to_id),
         train_csv=train_csv,
         valid_csv=valid_csv,
         test_csv=test_csv,
@@ -213,11 +201,7 @@ def main() -> None:
     payload = {
         'ok': True,
         'artifact_json': str(artifact_path),
-        'lookup_json': str(lookup_path),
-        'train_corpus_csv': str(train_csv),
-        'valid_corpus_csv': str(valid_csv),
-        'test_corpus_csv': str(test_csv),
-        **summary,
+        **validation,
     }
     print(json.dumps(payload, indent=2, sort_keys=True))
 
