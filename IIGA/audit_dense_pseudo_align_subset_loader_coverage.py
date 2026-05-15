@@ -3,10 +3,21 @@ from __future__ import annotations
 import argparse
 import json
 import pickle
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
 from dataloader import loader
+
+
+def load_json(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text(encoding='utf-8'))
+
+
+def load_lookup(path: Path) -> dict[str, int]:
+    with path.open('rb') as handle:
+        loaded = pickle.load(handle)
+    return {str(key): int(value) for key, value in loaded.items()}
 
 
 def read_corpus_ids(csv_path: Path) -> set[str]:
@@ -58,7 +69,7 @@ def load_anchor_audit_local(
     valid_csv: Path,
     test_csv: Path,
 ) -> dict[str, list[tuple[int, int]]]:
-    audit = json.loads(anchor_audit_json.read_text(encoding='utf-8'))
+    audit = load_json(anchor_audit_json)
 
     for leakage_key in ('validation_ids_in_anchors', 'valid_ids_in_anchors', 'test_ids_in_anchors'):
         leaked_ids = audit.get(leakage_key, []) if isinstance(audit, dict) else []
@@ -134,15 +145,9 @@ def load_anchor_audit_local(
     return anchor_map
 
 
-def load_lookup(path: Path) -> dict[str, int]:
-    with path.open('rb') as handle:
-        loaded = pickle.load(handle)
-    return {str(key): int(value) for key, value in loaded.items()}
-
-
-def dry_run(
+def audit_loader_coverage(
     artifact_json: Path,
-    lookup_path: Path,
+    lookup_pkl: Path,
     train_csv: Path,
     valid_csv: Path,
     test_csv: Path,
@@ -150,7 +155,7 @@ def dry_run(
     train_segment_root: Path,
     sample_probe_limit: int,
 ) -> dict[str, Any]:
-    word_to_id = load_lookup(lookup_path)
+    word_to_id = load_lookup(lookup_pkl)
     vocab_size = len(word_to_id)
     anchor_map = load_anchor_audit_local(
         artifact_json,
@@ -165,7 +170,7 @@ def dry_run(
         csv_file=str(train_csv),
         root_dir=str(train_root),
         segment_path=str(train_segment_root),
-        lookup=str(lookup_path),
+        lookup=str(lookup_pkl),
         rescale=224,
         batch_size=1,
         num_workers=0,
@@ -182,35 +187,74 @@ def dry_run(
     )
 
     target_sample_ids = sorted(anchor_map.keys())
+    target_sample_id_set = set(target_sample_ids)
     seen_target_sample_ids: set[str] = set()
+    sample_probe_examples: list[dict[str, Any]] = []
+    anchor_hits_by_sample: Counter[str] = Counter()
+    in_bounds_anchor_hits_by_sample: Counter[str] = Counter()
+    out_of_bounds_by_sample: Counter[str] = Counter()
     loader_batches_seen = 0
     loader_unique_sample_ids: set[str] = set()
-    sample_probe_examples: list[dict[str, Any]] = []
+    logged_step_hits: list[dict[str, Any]] = []
+    logging_interval = 100
 
     for batch in dataloader:
         x, x_lengths, y, y_lengths, hand_regions, _, sample_ids = batch
         loader_batches_seen += 1
+        step_index = loader_batches_seen - 1
+
         for batch_idx, sample_id in enumerate(sample_ids):
             sample_id_str = str(sample_id)
             loader_unique_sample_ids.add(sample_id_str)
-            if sample_id_str in anchor_map:
-                seen_target_sample_ids.add(sample_id_str)
-                if len(sample_probe_examples) < sample_probe_limit:
-                    raw_length = int(x_lengths[batch_idx]) if not hasattr(x_lengths[batch_idx], 'item') else int(x_lengths[batch_idx].item())
-                    sample_probe_examples.append(
-                        {
-                            'sample_id': sample_id_str,
-                            'raw_length': raw_length,
-                            'anchors': anchor_map[sample_id_str],
-                        }
-                    )
-        if seen_target_sample_ids == set(target_sample_ids):
+            if sample_id_str not in anchor_map:
+                continue
+
+            seen_target_sample_ids.add(sample_id_str)
+            raw_length = int(x_lengths[batch_idx]) if not hasattr(x_lengths[batch_idx], 'item') else int(x_lengths[batch_idx].item())
+            anchors = anchor_map[sample_id_str]
+            valid_anchor_count = 0
+            invalid_anchor_count = 0
+            for frame_idx, token_id in anchors:
+                anchor_hits_by_sample[sample_id_str] += 1
+                if frame_idx < raw_length:
+                    valid_anchor_count += 1
+                    in_bounds_anchor_hits_by_sample[sample_id_str] += 1
+                else:
+                    invalid_anchor_count += 1
+                    out_of_bounds_by_sample[sample_id_str] += 1
+
+            if len(sample_probe_examples) < sample_probe_limit:
+                sample_probe_examples.append(
+                    {
+                        'sample_id': sample_id_str,
+                        'step_index': step_index,
+                        'raw_length': raw_length,
+                        'anchors': anchors,
+                        'in_bounds_anchor_count': valid_anchor_count,
+                        'out_of_bounds_anchor_count': invalid_anchor_count,
+                    }
+                )
+
+            if step_index % logging_interval == 0:
+                logged_step_hits.append(
+                    {
+                        'step_index': step_index,
+                        'sample_id': sample_id_str,
+                        'raw_length': raw_length,
+                        'anchor_count': len(anchors),
+                        'in_bounds_anchor_count': valid_anchor_count,
+                    }
+                )
+
+        if seen_target_sample_ids == target_sample_id_set:
             break
 
     loaded_anchor_count = sum(len(entries) for entries in anchor_map.values())
     unique_token_ids = sorted({token_id for entries in anchor_map.values() for _, token_id in entries})
     min_anchors = min((len(entries) for entries in anchor_map.values()), default=0)
     max_anchors = max((len(entries) for entries in anchor_map.values()), default=0)
+    total_in_bounds = sum(in_bounds_anchor_hits_by_sample.values())
+    total_out_of_bounds = sum(out_of_bounds_by_sample.values())
 
     return {
         'loaded_anchor_count': loaded_anchor_count,
@@ -227,14 +271,21 @@ def dry_run(
         'loader_unique_sample_ids': len(loader_unique_sample_ids),
         'loader_target_sample_ids': target_sample_ids,
         'loader_seen_target_sample_ids': sorted(seen_target_sample_ids),
-        'loader_saw_all_target_sample_ids': seen_target_sample_ids == set(target_sample_ids),
+        'loader_saw_all_target_sample_ids': seen_target_sample_ids == target_sample_id_set,
         'sample_probe_examples': sample_probe_examples,
+        'logging_interval': logging_interval,
+        'logged_step_hits': logged_step_hits,
+        'logged_step_hit_count': len(logged_step_hits),
+        'total_anchor_hits_seen': sum(anchor_hits_by_sample.values()),
+        'total_in_bounds_anchor_hits_seen': total_in_bounds,
+        'total_out_of_bounds_anchor_hits_seen': total_out_of_bounds,
+        'samples_with_any_out_of_bounds': sorted(sample_id for sample_id, count in out_of_bounds_by_sample.items() if count > 0),
     }
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description='Dry-run the stable dense pseudo-align subset artifact through the real train.py anchor-loading contract and a shuffled train loader.'
+        description='Measure whether stable subset anchor-bearing samples naturally hit the train.py logging windows and whether their anchors stay in-bounds in a shuffled train loader.'
     )
     parser.add_argument('--artifact_json', required=True)
     parser.add_argument('--lookup_pkl', required=True)
@@ -246,9 +297,9 @@ def main() -> None:
     parser.add_argument('--sample_probe_limit', type=int, default=10)
     args = parser.parse_args()
 
-    payload = dry_run(
+    payload = audit_loader_coverage(
         artifact_json=Path(args.artifact_json),
-        lookup_path=Path(args.lookup_pkl),
+        lookup_pkl=Path(args.lookup_pkl),
         train_csv=Path(args.train_corpus_csv),
         valid_csv=Path(args.valid_corpus_csv),
         test_csv=Path(args.test_corpus_csv),
