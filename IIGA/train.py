@@ -3,7 +3,6 @@ import time
 import os
 import torch
 import torch.nn
-from torch.autograd import Variable
 import torch.nn.functional as F
 import torch.nn as nn
 import numpy as np
@@ -26,8 +25,6 @@ try:
     import progressbar
 except ImportError:
     progressbar = None
-
-import matplotlib.pyplot as plt
 
 #For model summary
 try:
@@ -152,9 +149,41 @@ def log_wandb(wandb_run, metrics):
 
 
 def current_learning_rate(optimizer):
-    if not optimizer.param_groups:
-        return 0.0
-    return optimizer.param_groups[0].get('lr', 0.0)
+    param_groups = getattr(optimizer, 'param_groups', None)
+    if param_groups:
+        return param_groups[0].get('lr', 0.0)
+
+    wrapped_optimizer = getattr(optimizer, 'optimizer', None)
+    wrapped_param_groups = getattr(wrapped_optimizer, 'param_groups', None)
+    if wrapped_param_groups:
+        return wrapped_param_groups[0].get('lr', 0.0)
+
+    rate = getattr(optimizer, '_rate', None)
+    if rate is not None:
+        return float(rate)
+
+    return 0.0
+
+
+def zero_optimizer_grad(optimizer, set_to_none=True):
+    zero_grad = getattr(optimizer, 'zero_grad', None)
+    if callable(zero_grad):
+        try:
+            zero_grad(set_to_none=set_to_none)
+        except TypeError:
+            zero_grad()
+        return
+
+    wrapped_optimizer = getattr(optimizer, 'optimizer', None)
+    wrapped_zero_grad = getattr(wrapped_optimizer, 'zero_grad', None)
+    if callable(wrapped_zero_grad):
+        try:
+            wrapped_zero_grad(set_to_none=set_to_none)
+        except TypeError:
+            wrapped_zero_grad()
+        return
+
+    raise AttributeError('optimizer does not expose zero_grad')
 
 
 def cr_ctc_consistency_loss(log_probs_a, log_probs_b, input_lengths):
@@ -394,6 +423,9 @@ parser.add_argument('--weight_decay', type= float , default = 5e-5)
 parser.add_argument('--batch_size', type=int, default=2,
                     help='size of one minibatch')
 
+parser.add_argument('--accumulation_steps', type=int, default=1,
+                    help='number of micro-batches to accumulate before each optimizer step')
+
 parser.add_argument('--initial_lr', type=float, default=0.0001,
                     help='initial learning rate')
 
@@ -566,6 +598,9 @@ print ("Start Time: "+start_date)
 
 args = parser.parse_args()
 
+if args.accumulation_steps < 1:
+    parser.error('--accumulation_steps must be at least 1.')
+
 if args.encoder_type == 'conformer' and args.hand_query:
     parser.error('--encoder_type conformer is not supported with --hand_query in the first Conformer branch.')
 
@@ -642,6 +677,11 @@ def run_epoch(model, data, is_train=False, device=None, n_devices=1):
         phase='valid'
 
     start_time = time.time()
+    data_len = len(data)
+    accumulation_steps = max(1, args.accumulation_steps)
+
+    if is_train:
+        zero_optimizer_grad(optimizer, set_to_none=True)
 
     loss = 0.0
     total_loss = 0.0
@@ -649,10 +689,6 @@ def run_epoch(model, data, is_train=False, device=None, n_devices=1):
     batch_tokens = 0.0
     total_seqs = 0
     tokens = 0
-    total_correct = 0.0
-    n_correct = 0.0
-
-    wer_score = 0.0
     total_wer_score = 0.0
     count = 0
 
@@ -711,20 +747,12 @@ def run_epoch(model, data, is_train=False, device=None, n_devices=1):
 
         if(args.distributed):
 
-            #Zeroing gradients
-            feature_extractor.zero_grad()
-            encoder.zero_grad()
-            position.zero_grad()
-            output_layer.zero_grad()
-
             src_emb, _, _ = feature_extractor(x)
             src_emb = position(src_emb)
             src_emb = encoder(src_emb, None, batch.src_mask)
             output_context = output_layer(src_emb)
 
             if(args.hand_query):
-                hand_extractor.zero_grad()
-
                 hand_emb = hand_extractor(hand_regions)
                 hand_emb = position(hand_emb)
                 hand_emb = encoder(hand_emb, None, batch.src_mask)
@@ -738,8 +766,6 @@ def run_epoch(model, data, is_train=False, device=None, n_devices=1):
                 output_hand = None
 
         else:
-            #Zeroing gradients
-            model.zero_grad()
 
             #Shape(batch_size, tgt_seq_length, tgt_vocab_size)
             #NOTE: no need for trg if we dont have a decoder
@@ -827,7 +853,7 @@ def run_epoch(model, data, is_train=False, device=None, n_devices=1):
         y_lengths = torch.IntTensor(y_lengths)
 
 
-        if(is_train==False):
+        if not is_train:
             decoded_preds = decode_ctc_batch(output, x_lengths, blank_index)
 
             for i, p in enumerate(decoded_preds):
@@ -903,20 +929,27 @@ def run_epoch(model, data, is_train=False, device=None, n_devices=1):
                 last_anchor_ce = anchor_ce.detach().item()
                 last_anchor_count = anchor_count
 
-        total_loss += loss
+        total_loss += loss.detach()
         total_seqs += batch.seq
         total_tokens += (y != blank_index).data.sum()
         tokens += (y != blank_index).data.sum()
         batch_tokens += (y != blank_index).data.sum()
 
         if is_train:
+            window_start = (step // accumulation_steps) * accumulation_steps
+            window_end = min(window_start + accumulation_steps, data_len)
+            current_window_size = window_end - window_start
+            scaled_loss = loss / current_window_size
 
-            loss.backward()
+            scaled_loss.backward()
 
-            #Weight clipping
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1)
+            should_step = ((step + 1) % accumulation_steps == 0) or (step + 1 == data_len)
+            if should_step:
+                #Weight clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1)
 
-            optimizer.step()
+                optimizer.step()
+                zero_optimizer_grad(optimizer, set_to_none=True)
 
             should_log_anchor_step = args.anchor_ce_weight > 0.0 and args.anchor_log_every_step
 
@@ -924,7 +957,7 @@ def run_epoch(model, data, is_train=False, device=None, n_devices=1):
                 elapsed = time.time() - start_time
                 telemetry = format_device_telemetry(telemetry_poller.sample())
                 print("Step: %d, Loss: %f, Frame per Sec: %f, Token per sec: %f"%
-                      (step, (loss / batch_tokens), total_seqs * batch_size / elapsed, tokens / elapsed))
+                      (step, (loss.detach() / batch_tokens), total_seqs * batch_size / elapsed, tokens / elapsed))
                 if args.anchor_ce_weight > 0.0:
                     if last_anchor_ce is None:
                         print("Anchor CE: skipped, Anchors: 0")
@@ -1174,7 +1207,7 @@ if(args.checkpoint):
         milestones = [int(v.strip()) for v in args.milestones.split(",")]
         scheduler = MultiStepLR(optimizer, milestones=milestones, gamma=0.1)
 
-if(args.checkpoint == None or args.resume == False):
+if args.checkpoint is None or not args.resume:
     start_epoch = 0
 
     if args.scheduler == 'multi-step':
@@ -1205,7 +1238,7 @@ for epoch in range(start_epoch, num_epochs):
 
     print('\nEPOCH '+str(epoch)+' ------------------')
     #print('LR',scheduler.get_lr())
-    print(optimizer.param_groups[0]['lr'])
+    print(current_learning_rate(optimizer))
     # RUN MODEL ON TRAINING DATA
     train_loss = run_epoch(model, train_dataloader, True, device=device)
     print("After train epoch..")
