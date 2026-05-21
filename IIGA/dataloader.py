@@ -169,6 +169,8 @@ class PhoenixDataset(Dataset):
 
         seq_name = os.path.join(self.root_dir, name,'1')
         segments_name= os.path.join(self.segment_path, name)
+        trsf_images = None
+        hand_images = None
 
         for path, d, files in os.walk(seq_name):
             images = sorted(
@@ -245,6 +247,9 @@ class PhoenixDataset(Dataset):
                     else:
                         trsf_images[i] = self.transform(annotated_image[:, :, :self.channels])
                     i+=1
+
+        if trsf_images is None:
+            raise FileNotFoundError(f'No readable frame sequence found for sample {name} under {seq_name}')
 
         #Retrive the translation (ground truth text translation) from csv annotations
         translation = self.annotations.iloc[idx, 0].split('|')[-1]
