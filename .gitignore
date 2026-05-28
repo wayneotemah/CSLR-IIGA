@@ -1,0 +1,6 @@
+EXPERIMENTATIONS/
+wandb/
+IIGA/stable_dense_pseudo_align_representative_surface.py
+
+__pycache__/
+*.py[cod]
