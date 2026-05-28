@@ -464,6 +464,10 @@ parser.add_argument('--encoder_type', type=str, default='legacy', choices=['lega
                     help='sequence encoder type; legacy preserves the original CSLR-IIGA encoder path')
 parser.add_argument('--conformer_kernel_size', type=int, default=17,
                     help='depthwise convolution kernel size for --encoder_type conformer; must be odd')
+parser.add_argument('--segment_attention_mode', type=str, default='on', choices=['on', 'off'],
+                    help='legacy encoder only: keep or ablate the existing segment attention sublayer')
+parser.add_argument('--log_segment_stats', action='store_true',
+                    help='Log first-pass segment proposal statistics from the legacy encoder for diagnostics.')
 
 parser.add_argument('--image_type', type=str, default='rgb',
                     help='Train on rgb/grayscale images')
@@ -603,6 +607,12 @@ if args.accumulation_steps < 1:
 
 if args.encoder_type == 'conformer' and args.hand_query:
     parser.error('--encoder_type conformer is not supported with --hand_query in the first Conformer branch.')
+
+if args.encoder_type != 'legacy' and args.segment_attention_mode != 'on':
+    parser.error('--segment_attention_mode off is only supported with --encoder_type legacy.')
+
+if args.encoder_type != 'legacy' and args.log_segment_stats:
+    parser.error('--log_segment_stats is only supported with --encoder_type legacy.')
 
 if args.anchor_ce_weight < 0.0:
     parser.error('--anchor_ce_weight must be non-negative.')
@@ -1110,7 +1120,8 @@ model = TRANSFORMER(tgt_vocab=vocab_size, n_stacks=args.num_layers, n_units=args
                             n_heads=args.n_heads, window_size=args.local_window ,d_ff=args.d_ff, dropout=1.-args.dp_keep_prob, image_size=args.rescale, pretrained=args.pretrained,
                             emb_type=args.emb_type, emb_network=args.emb_network,
                             full_pretrained=args.full_pretrained, hand_pretrained=args.hand_pretrained, freeze_cnn=args.freeze_cnn, channels=channels,
-                            encoder_type=args.encoder_type, conformer_kernel_size=args.conformer_kernel_size)
+                            encoder_type=args.encoder_type, conformer_kernel_size=args.conformer_kernel_size,
+                            segment_attention_mode=args.segment_attention_mode, log_segment_stats=args.log_segment_stats)
 trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 print('model parameters:',trainable_params)

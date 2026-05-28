@@ -790,7 +790,8 @@ class PositionalEncoding(nn.Module):
 
 class EncoderStack(nn.Module):
 
-    def __init__(self, size, self_attn, feed_forward, segment_attention, dropout, window_size):
+    def __init__(self, size, self_attn, feed_forward, segment_attention, dropout, window_size,
+                 segment_attention_mode='on', log_segment_stats=False):
         super(EncoderStack, self).__init__()
         self.self_attn = self_attn
         self.feed_forward = feed_forward
@@ -800,6 +801,9 @@ class EncoderStack(nn.Module):
         self.size = size
         self.window_size = window_size
         self.window_overlap = window_size//2
+        self.segment_attention_mode = segment_attention_mode
+        self.log_segment_stats = log_segment_stats
+        self._logged_segment_stats = False
 
     def forward(self, x, mask=None, hand_emb=None):
 
@@ -816,6 +820,26 @@ class EncoderStack(nn.Module):
         for i in range(batch_size):
             proposal_count_by_video.append(int(torch.sum(mask[i]))//self.window_overlap - 1)
 
+        proposal_count_by_video = [max(0, count) for count in proposal_count_by_video]
+
+        if self.log_segment_stats and not self._logged_segment_stats:
+            mean_count = float(sum(proposal_count_by_video)) / len(proposal_count_by_video) if proposal_count_by_video else 0.0
+            min_count = min(proposal_count_by_video) if proposal_count_by_video else 0
+            max_count = max(proposal_count_by_video) if proposal_count_by_video else 0
+            degenerate_count = sum(1 for count in proposal_count_by_video if count <= 0)
+            print(
+                'Segment attention stats: '
+                f'temp_len={temp_len}, '
+                f'window_size={self.window_size}, '
+                f'window_overlap={self.window_overlap}, '
+                f'max_segments_number={max_segments_number}, '
+                f'proposal_count_min={min_count}, '
+                f'proposal_count_mean={mean_count:.2f}, '
+                f'proposal_count_max={max_count}, '
+                f'degenerate_videos={degenerate_count}/{batch_size}'
+            )
+            self._logged_segment_stats = True
+
         for n in range(batch_size):
             for k in range(proposal_count_by_video[n]):
 
@@ -831,7 +855,8 @@ class EncoderStack(nn.Module):
         else:
             x = self.sublayer[0](x, None, lambda x: self.self_attn(x, mask))
 
-            x = self.sublayer[1](x, None, lambda x: self.segment_attention(x, inter_attn_mask, proposal_project_mask))
+            if self.segment_attention_mode == 'on':
+                x = self.sublayer[1](x, None, lambda x: self.segment_attention(x, inter_attn_mask, proposal_project_mask))
 
         return self.sublayer[2](x, None, self.feed_forward)
 
@@ -1081,7 +1106,7 @@ class ConformerEncoderLayer(nn.Module):
         return self.final_norm(x)
 
 
-def make_model(tgt_vocab, n_stacks=2, n_units=512, n_heads=10, window_size=10 , d_ff=2048, dropout=0.3, image_size=224, pretrained=True, emb_type='2d', emb_network='mb2', full_pretrained=None, hand_pretrained=None, freeze_cnn=False, channels=3, encoder_type='legacy', conformer_kernel_size=17):
+def make_model(tgt_vocab, n_stacks=2, n_units=512, n_heads=10, window_size=10 , d_ff=2048, dropout=0.3, image_size=224, pretrained=True, emb_type='2d', emb_network='mb2', full_pretrained=None, hand_pretrained=None, freeze_cnn=False, channels=3, encoder_type='legacy', conformer_kernel_size=17, segment_attention_mode='on', log_segment_stats=False):
 
     c = copy.deepcopy
     #attn = MultiHeadedAttention(n_heads, n_units, dropout)
@@ -1090,8 +1115,23 @@ def make_model(tgt_vocab, n_stacks=2, n_units=512, n_heads=10, window_size=10 , 
     ff = PositionWise(n_units, d_ff, dropout)
     position = PositionalEncoding(n_units, dropout)
 
+    if segment_attention_mode not in {'on', 'off'}:
+        raise ValueError(f'Unknown segment_attention_mode: {segment_attention_mode}')
+
     if encoder_type == 'legacy':
-        encoder = Encoder(EncoderStack(n_units, c(attn), c(ff), c(seg_att), dropout, window_size), 2)
+        encoder = Encoder(
+            EncoderStack(
+                n_units,
+                c(attn),
+                c(ff),
+                c(seg_att),
+                dropout,
+                window_size,
+                segment_attention_mode=segment_attention_mode,
+                log_segment_stats=log_segment_stats,
+            ),
+            2,
+        )
     elif encoder_type == 'conformer':
         encoder = Encoder(ConformerEncoderLayer(n_units, n_heads, d_ff, dropout, conformer_kernel_size), n_stacks)
     else:
