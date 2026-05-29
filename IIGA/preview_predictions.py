@@ -139,6 +139,10 @@ if __name__ == '__main__':
     parser.add_argument('--conformer_kernel_size', type=int, default=17)
     parser.add_argument('--segment_attention_mode', type=str, default='on', choices=['on', 'off'])
     parser.add_argument('--log_segment_stats', action='store_true')
+    parser.add_argument('--pose_root', type=str, default=None,
+                        help='Optional root containing prepared pose sidecars under pose_landmarks/<split>/<sample_id>/1/.')
+    parser.add_argument('--pose_fusion_mode', type=str, default='off', choices=['off', 'add'],
+                        help='Optional pose sidecar fusion mode. off keeps the RGB baseline unchanged.')
     parser.add_argument('--image_type', type=str, default='rgb', choices=['rgb', 'grayscale'])
     parser.add_argument('--local_window', type=int, default=10)
     parser.add_argument('--fixed_padding', type=int, default=None)
@@ -165,6 +169,10 @@ if __name__ == '__main__':
         parser.error('--segment_attention_mode off is only supported with --encoder_type legacy.')
     if args.encoder_type not in ('legacy', 'iiga') and args.log_segment_stats:
         parser.error('--log_segment_stats is only supported with --encoder_type legacy or iiga.')
+    if args.pose_fusion_mode != 'off' and not args.pose_root:
+        parser.error('--pose_root is required when --pose_fusion_mode is enabled.')
+    if args.pose_fusion_mode != 'off' and args.hand_query:
+        parser.error('--pose_fusion_mode is not supported with --hand_query in preview mode.')
     wandb_run = init_wandb(args)
 
     device = select_device()
@@ -182,6 +190,11 @@ if __name__ == '__main__':
 
     split_path = pick_split_paths(args.data, args.split, hand_query=args.hand_query)
 
+    pose_split_root = None
+    if args.pose_root:
+        split_pose_name = 'dev' if args.split in ('valid', 'dev') else args.split
+        pose_split_root = str(Path(args.pose_root) / split_pose_name)
+
     dataloader, _ = loader(
         csv_file=split_path[1],
         root_dir=split_path[0],
@@ -198,6 +211,8 @@ if __name__ == '__main__':
         data_stats=None,
         hand_stats=None,
         channels=channels,
+        pose_root=pose_split_root,
+        return_pose_landmarks=args.pose_fusion_mode != 'off',
     )
 
     model = TRANSFORMER(
@@ -216,6 +231,7 @@ if __name__ == '__main__':
         conformer_kernel_size=args.conformer_kernel_size,
         segment_attention_mode=args.segment_attention_mode,
         log_segment_stats=args.log_segment_stats,
+        pose_fusion_mode=args.pose_fusion_mode,
     )
     model = load_checkpoint(model, args.model_path, device).to(device)
     model.eval()
@@ -223,9 +239,21 @@ if __name__ == '__main__':
     shown = 0
     preview_rows = []
     with torch.no_grad():
-        for x, x_lengths, y, y_lengths, hand_regions, _ in dataloader:
+        for batch_data in dataloader:
+            pose_landmarks = None
+            if args.pose_fusion_mode != 'off':
+                x, x_lengths, y, y_lengths, hand_regions, _, pose_landmarks = batch_data
+            else:
+                x, x_lengths, y, y_lengths, hand_regions, _ = batch_data
             x = x.to(device)
             hand_regions = hand_regions.to(device) if (args.hand_query and hand_regions is not None) else None
+            if pose_landmarks is not None:
+                pose_landmarks = {
+                    'pose': pose_landmarks['pose'].to(device),
+                    'left_hand': pose_landmarks['left_hand'].to(device),
+                    'right_hand': pose_landmarks['right_hand'].to(device),
+                    'frame_names': pose_landmarks['frame_names'],
+                }
 
             batch = Batch(
                 x_lengths,
@@ -242,7 +270,8 @@ if __name__ == '__main__':
                 x,
                 batch.src_mask,
                 batch.rel_mask,
-                hand_regions
+                hand_regions,
+                pose_landmarks=pose_landmarks,
             )
             
             if output is None:
