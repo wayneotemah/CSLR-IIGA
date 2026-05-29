@@ -235,7 +235,17 @@ def landmark_array_from_tasks(landmarks, count, include_visibility=False):
     if not landmarks:
         return arr, False
 
-    for i, landmark in enumerate(landmarks[:count]):
+    task_landmarks = landmarks
+    if hasattr(task_landmarks, 'landmark'):
+        task_landmarks = task_landmarks.landmark
+    elif isinstance(task_landmarks, (list, tuple)) and task_landmarks:
+        first = task_landmarks[0]
+        if hasattr(first, 'landmark'):
+            task_landmarks = first.landmark
+        elif isinstance(first, (list, tuple)) and first and hasattr(first[0], 'x'):
+            task_landmarks = first
+
+    for i, landmark in enumerate(task_landmarks[:count]):
         arr[i, 0] = landmark.x
         arr[i, 1] = landmark.y
         arr[i, 2] = landmark.z
@@ -282,9 +292,9 @@ def write_pose_landmarks(frame_dir, pose_dir, pose_extractor, sample_id):
             rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             mp_image = mp_image_mod.Image(image_format=mp_image_mod.ImageFormat.SRGB, data=rgb_image)
             result = extractor.detect(mp_image)
-            pose_landmarks = result.pose_landmarks[0] if getattr(result, 'pose_landmarks', None) else []
-            left_hand_landmarks = result.left_hand_landmarks[0] if getattr(result, 'left_hand_landmarks', None) else []
-            right_hand_landmarks = result.right_hand_landmarks[0] if getattr(result, 'right_hand_landmarks', None) else []
+            pose_landmarks = getattr(result, 'pose_landmarks', None) or []
+            left_hand_landmarks = getattr(result, 'left_hand_landmarks', None) or []
+            right_hand_landmarks = getattr(result, 'right_hand_landmarks', None) or []
             pose_arr, pose_detected = landmark_array_from_tasks(pose_landmarks, 33, include_visibility=True)
             left_hand_arr, left_detected = landmark_array_from_tasks(left_hand_landmarks, 21)
             right_hand_arr, right_detected = landmark_array_from_tasks(right_hand_landmarks, 21)
