@@ -135,7 +135,7 @@ if __name__ == '__main__':
     parser.add_argument('--emb_type', type=str, default='2d')
     parser.add_argument('--emb_network', type=str, default='mb2')
     parser.add_argument('--hand_query', action='store_true')
-    parser.add_argument('--encoder_type', type=str, default='legacy', choices=['legacy', 'conformer'])
+    parser.add_argument('--encoder_type', type=str, default='legacy', choices=['legacy', 'iiga', 'conformer'])
     parser.add_argument('--conformer_kernel_size', type=int, default=17)
     parser.add_argument('--segment_attention_mode', type=str, default='on', choices=['on', 'off'])
     parser.add_argument('--log_segment_stats', action='store_true')
@@ -159,10 +159,12 @@ if __name__ == '__main__':
     args = parser.parse_args()
     if args.encoder_type == 'conformer' and args.hand_query:
         parser.error('--encoder_type conformer is not supported with --hand_query in the first Conformer branch.')
-    if args.encoder_type != 'legacy' and args.segment_attention_mode != 'on':
+    if args.encoder_type == 'iiga' and args.segment_attention_mode != 'on':
+        parser.error('--encoder_type iiga always uses the explicit local+segment path with segment attention enabled.')
+    if args.encoder_type not in ('legacy', 'iiga') and args.segment_attention_mode != 'on':
         parser.error('--segment_attention_mode off is only supported with --encoder_type legacy.')
-    if args.encoder_type != 'legacy' and args.log_segment_stats:
-        parser.error('--log_segment_stats is only supported with --encoder_type legacy.')
+    if args.encoder_type not in ('legacy', 'iiga') and args.log_segment_stats:
+        parser.error('--log_segment_stats is only supported with --encoder_type legacy or iiga.')
     wandb_run = init_wandb(args)
 
     device = select_device()
