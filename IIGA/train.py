@@ -10,7 +10,6 @@ import datetime as dt
 import _pickle as pickle
 import json
 
-
 from torch.optim.lr_scheduler import StepLR, MultiStepLR
 
 from transformer import make_model as TRANSFORMER
@@ -373,6 +372,17 @@ def optional_probability(value):
 # Arg parsing
 ##############
 
+
+def parse_bool_flag(value):
+    if isinstance(value, bool):
+        return value
+    lowered = str(value).strip().lower()
+    if lowered in {'1', 'true', 't', 'yes', 'y', 'on'}:
+        return True
+    if lowered in {'0', 'false', 'f', 'no', 'n', 'off'}:
+        return False
+    raise argparse.ArgumentTypeError(f'Invalid boolean value: {value}')
+
 parser = argparse.ArgumentParser(description='Training the transformer-like network')
 
 parser.add_argument('--data', type=str, default=os.path.join('data','phoenix-2014.v3','phoenix2014-release','phoenix-2014-multisigner'),
@@ -442,7 +452,7 @@ parser.add_argument('--n_heads', type=int, default=10,
                     help='number of self attention heads')
 
 #Pretrained weights
-parser.add_argument('--pretrained', type=bool, default=False,
+parser.add_argument('--pretrained', type=parse_bool_flag, nargs='?', const=True, default=False,
                     help='embedding layers are pretrained using imagenet')
 
 parser.add_argument('--full_pretrained', type=str, default=None,
