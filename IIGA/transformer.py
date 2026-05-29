@@ -907,6 +907,31 @@ class Output_layer(nn.Module):
     def forward(self, x):
         return F.log_softmax(self.proj(x), dim=-1)
 
+
+class VisualTemporalBranch(nn.Module):
+    def __init__(self, d_model, dropout=0.1):
+        super(VisualTemporalBranch, self).__init__()
+        self.norm = LayerNormalization(d_model)
+        self.conv1 = nn.Conv1d(d_model, d_model, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm1d(d_model)
+        self.conv2 = nn.Conv1d(d_model, d_model, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm1d(d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        residual = x
+        x = self.norm(x).transpose(1, 2)
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = F.silu(x)
+        x = self.dropout(x)
+        x = self.conv2(x)
+        x = self.bn2(x)
+        x = F.silu(x)
+        x = self.dropout(x)
+        x = x.transpose(1, 2)
+        return residual + x
+
 ##########
 
 #Full transformer network architecture (encoder + decoder + output)
@@ -918,6 +943,7 @@ class FullTransformer(nn.Module):
         self.output_layer = output
         self.interctc_output_layer = copy.deepcopy(output)
         self.visual_ctc_output_layer = copy.deepcopy(output)
+        self.visual_temporal_branch = VisualTemporalBranch(output.proj.in_features)
         self.hand_emb = HandExtractor()
         self.position = position
         self.window_size = window_size
@@ -972,19 +998,21 @@ class FullTransformer(nn.Module):
 
         intermediate_out = None
         visual_ctc_out = None
+        encoder_input = src_emb
 
         if(arch=='CNN-attention-CTC'):
             #(batch, seq_length, feature_dim)
             #src_emb = self.position(src_emb)
 
             if return_visual_ctc:
-                visual_ctc_out = self.visual_ctc_output_layer(src_emb)
+                encoder_input = self.visual_temporal_branch(src_emb)
+                visual_ctc_out = self.visual_ctc_output_layer(encoder_input)
 
             if return_intermediate_ctc:
-                src_emb, intermediate_emb = self.encode(src_emb, None, src_mask, return_intermediate=True, intermediate_layer=intermediate_ctc_layer)
+                src_emb, intermediate_emb = self.encode(encoder_input, None, src_mask, return_intermediate=True, intermediate_layer=intermediate_ctc_layer)
                 intermediate_out = self.interctc_output_layer(intermediate_emb)
             else:
-                src_emb = self.encode(src_emb, None, src_mask)
+                src_emb = self.encode(encoder_input, None, src_mask)
 
         full_out = self.output_layer(src_emb)
 
