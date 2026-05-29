@@ -932,11 +932,31 @@ class VisualTemporalBranch(nn.Module):
         x = x.transpose(1, 2)
         return residual + x
 
+
+class PoseSidecarProjector(nn.Module):
+    def __init__(self, d_model, dropout=0.1):
+        super(PoseSidecarProjector, self).__init__()
+        self.input_norm = LayerNormalization(33 * 4 + 21 * 3 + 21 * 3)
+        self.proj = nn.Linear(33 * 4 + 21 * 3 + 21 * 3, d_model)
+        self.out_norm = LayerNormalization(d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, pose_landmarks):
+        pose = pose_landmarks['pose'].reshape(pose_landmarks['pose'].shape[0], pose_landmarks['pose'].shape[1], -1)
+        left_hand = pose_landmarks['left_hand'].reshape(pose_landmarks['left_hand'].shape[0], pose_landmarks['left_hand'].shape[1], -1)
+        right_hand = pose_landmarks['right_hand'].reshape(pose_landmarks['right_hand'].shape[0], pose_landmarks['right_hand'].shape[1], -1)
+        fused = torch.cat((pose, left_hand, right_hand), dim=-1)
+        fused = self.input_norm(fused)
+        fused = self.proj(fused)
+        fused = F.silu(fused)
+        fused = self.dropout(fused)
+        return self.out_norm(fused)
+
 ##########
 
 #Full transformer network architecture (encoder + decoder + output)
 class FullTransformer(nn.Module):
-    def __init__(self, window_size, encoder, src_emb, output, position):
+    def __init__(self, window_size, encoder, src_emb, output, position, pose_fusion_mode='off'):
         super(FullTransformer, self).__init__()
         self.encoder = encoder
         self.src_emb = src_emb
@@ -944,10 +964,12 @@ class FullTransformer(nn.Module):
         self.interctc_output_layer = copy.deepcopy(output)
         self.visual_ctc_output_layer = copy.deepcopy(output)
         self.visual_temporal_branch = VisualTemporalBranch(output.proj.in_features)
+        self.pose_sidecar_projector = PoseSidecarProjector(output.proj.in_features)
         self.hand_emb = HandExtractor()
         self.position = position
         self.window_size = window_size
         self.window_overlap = window_size//2
+        self.pose_fusion_mode = pose_fusion_mode
         #Placeholder for gradients
         self.gradients = None
 
@@ -970,7 +992,7 @@ class FullTransformer(nn.Module):
         return self.encoder(src_emb, hand_emb, src_mask, return_intermediate=return_intermediate, intermediate_layer=intermediate_layer)
 
     #Call this when training
-    def forward(self, src, src_mask, rel_mask=None, hand_seqs=None, arch='CNN-attention-CTC', return_intermediate_ctc=False, intermediate_ctc_layer=None, return_visual_ctc=False):
+    def forward(self, src, src_mask, rel_mask=None, hand_seqs=None, arch='CNN-attention-CTC', return_intermediate_ctc=False, intermediate_ctc_layer=None, return_visual_ctc=False, pose_landmarks=None):
         
         #Use normal mask
         if(type(rel_mask) == type(None)):
@@ -999,6 +1021,16 @@ class FullTransformer(nn.Module):
         intermediate_out = None
         visual_ctc_out = None
         encoder_input = src_emb
+
+        if self.pose_fusion_mode == 'add' and pose_landmarks is not None:
+            pose_emb = self.pose_sidecar_projector(pose_landmarks)
+            if pose_emb.size(1) < encoder_input.size(1):
+                pad_len = encoder_input.size(1) - pose_emb.size(1)
+                pose_emb = torch.nn.functional.pad(pose_emb, (0, 0, 0, pad_len), mode='constant', value=0)
+            elif pose_emb.size(1) > encoder_input.size(1):
+                pose_emb = pose_emb[:, :encoder_input.size(1), :]
+            pose_mask = src_mask.squeeze(1).unsqueeze(-1).to(pose_emb.dtype)
+            encoder_input = encoder_input + (pose_emb * pose_mask)
 
         if(arch=='CNN-attention-CTC'):
             #(batch, seq_length, feature_dim)
@@ -1134,7 +1166,7 @@ class ConformerEncoderLayer(nn.Module):
         return self.final_norm(x)
 
 
-def make_model(tgt_vocab, n_stacks=2, n_units=512, n_heads=10, window_size=10 , d_ff=2048, dropout=0.3, image_size=224, pretrained=True, emb_type='2d', emb_network='mb2', full_pretrained=None, hand_pretrained=None, freeze_cnn=False, channels=3, encoder_type='legacy', conformer_kernel_size=17, segment_attention_mode='on', log_segment_stats=False):
+def make_model(tgt_vocab, n_stacks=2, n_units=512, n_heads=10, window_size=10 , d_ff=2048, dropout=0.3, image_size=224, pretrained=True, emb_type='2d', emb_network='mb2', full_pretrained=None, hand_pretrained=None, freeze_cnn=False, channels=3, encoder_type='legacy', conformer_kernel_size=17, segment_attention_mode='on', log_segment_stats=False, pose_fusion_mode='off'):
 
     c = copy.deepcopy
     #attn = MultiHeadedAttention(n_heads, n_units, dropout)
@@ -1145,6 +1177,9 @@ def make_model(tgt_vocab, n_stacks=2, n_units=512, n_heads=10, window_size=10 , 
 
     if segment_attention_mode not in {'on', 'off'}:
         raise ValueError(f'Unknown segment_attention_mode: {segment_attention_mode}')
+
+    if pose_fusion_mode not in {'off', 'add'}:
+        raise ValueError(f'Unknown pose_fusion_mode: {pose_fusion_mode}')
 
     if encoder_type == 'legacy':
         encoder = Encoder(
@@ -1183,7 +1218,8 @@ def make_model(tgt_vocab, n_stacks=2, n_units=512, n_heads=10, window_size=10 , 
         encoder,
         src_2Dembeddings(n_units, pretrained, image_size, network_type=emb_network, channels=channels),
         Output_layer(n_units, tgt_vocab),
-        c(position)
+        c(position),
+        pose_fusion_mode=pose_fusion_mode
         )
 
     #Load pretrained CNNs (trained on same dataset)

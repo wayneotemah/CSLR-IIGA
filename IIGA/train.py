@@ -587,6 +587,11 @@ parser.add_argument('--anchor_log_every_step', action='store_true',
 parser.add_argument('--anchor_debug_sample_ids', type=str, default=None,
                     help='Comma-separated sample IDs to log when they appear in training batches during anchor CE debugging.')
 
+parser.add_argument('--pose_root', type=str, default=None,
+                    help='Optional root containing prepared pose sidecars under pose_landmarks/<split>/<sample_id>/1/.')
+parser.add_argument('--pose_fusion_mode', type=str, default='off', choices=['off', 'add'],
+                    help='Optional pose sidecar fusion mode. off keeps the RGB baseline unchanged.')
+
 
 #----------------------------------------------------------------------------------------
 
@@ -631,6 +636,12 @@ if args.anchor_ce_weight > 0.0:
         parser.error('--anchor_ce_weight must not be combined with InterCTC, CR-CTC, or visual CTC in the first anchor branch.')
     if args.ctc_blank_logit_penalty != 0.0:
         parser.error('--anchor_ce_weight must not be combined with --ctc_blank_logit_penalty in the first anchor branch.')
+
+if args.pose_fusion_mode != 'off' and not args.pose_root:
+    parser.error('--pose_root is required when --pose_fusion_mode is enabled.')
+
+if args.pose_fusion_mode != 'off' and args.hand_query:
+    parser.error('--pose_fusion_mode is not supported with --hand_query in the first pose branch.')
 
 #Set the random seed manually for reproducibility.
 torch.manual_seed(args.seed)
@@ -726,7 +737,13 @@ def run_epoch(model, data, is_train=False, device=None, n_devices=1):
     #Loop over minibatches
     for step, batch_data in enumerate(data):
 
-        if len(batch_data) == 7:
+        pose_landmarks = None
+        if len(batch_data) == 8:
+            x, x_lengths, y, y_lengths, hand_regions, hand_lengths, pose_landmarks, sample_ids = batch_data
+        elif len(batch_data) == 7 and args.pose_fusion_mode != 'off':
+            x, x_lengths, y, y_lengths, hand_regions, hand_lengths, pose_landmarks = batch_data
+            sample_ids = None
+        elif len(batch_data) == 7:
             x, x_lengths, y, y_lengths, hand_regions, hand_lengths, sample_ids = batch_data
         elif len(batch_data) == 6:
             x, x_lengths, y, y_lengths, hand_regions, hand_lengths = batch_data
@@ -744,6 +761,14 @@ def run_epoch(model, data, is_train=False, device=None, n_devices=1):
         #print(x.size())
         y = torch.from_numpy(y).to(device)
         x = x.to(device)
+
+        if pose_landmarks is not None:
+            pose_landmarks = {
+                'pose': pose_landmarks['pose'].to(device),
+                'left_hand': pose_landmarks['left_hand'].to(device),
+                'right_hand': pose_landmarks['right_hand'].to(device),
+                'frame_names': pose_landmarks['frame_names'],
+            }
 
         if(args.hand_query):
              hand_regions = hand_regions.to(device)
@@ -796,6 +821,7 @@ def run_epoch(model, data, is_train=False, device=None, n_devices=1):
                     return_intermediate_ctc=True,
                     intermediate_ctc_layer=args.interctc_layer,
                     return_visual_ctc=True,
+                    pose_landmarks=pose_landmarks,
                 )
             elif use_interctc:
                 output, output_context, output_hand, output_interctc = model.forward(
@@ -806,6 +832,7 @@ def run_epoch(model, data, is_train=False, device=None, n_devices=1):
                     args.arch,
                     return_intermediate_ctc=True,
                     intermediate_ctc_layer=args.interctc_layer,
+                    pose_landmarks=pose_landmarks,
                 )
             elif use_visual_ctc:
                 output, output_context, output_hand, output_visual_ctc = model.forward(
@@ -815,12 +842,13 @@ def run_epoch(model, data, is_train=False, device=None, n_devices=1):
                     hand_regions,
                     args.arch,
                     return_visual_ctc=True,
+                    pose_landmarks=pose_landmarks,
                 )
             else:
-                output, output_context, output_hand = model.forward(x, batch.src_mask, batch.rel_mask, hand_regions, args.arch)
+                output, output_context, output_hand = model.forward(x, batch.src_mask, batch.rel_mask, hand_regions, args.arch, pose_landmarks=pose_landmarks)
 
             if use_cr_ctc:
-                _, output_context_cr, _ = model.forward(x, batch.src_mask, batch.rel_mask, hand_regions, args.arch)
+                _, output_context_cr, _ = model.forward(x, batch.src_mask, batch.rel_mask, hand_regions, args.arch, pose_landmarks=pose_landmarks)
 
         #CTC loss expects (Seq, batch, vocab)
         if(args.hand_query):
@@ -989,7 +1017,7 @@ def run_epoch(model, data, is_train=False, device=None, n_devices=1):
 
         #Free some memory
         #NOTE: this helps alot in avoiding cuda out of memory
-        del loss, output, output_context, output_hand, output_interctc, output_visual_ctc, output_context_cr, output_cr, y, hand_regions, batch
+        del loss, output, output_context, output_hand, output_interctc, output_visual_ctc, output_context_cr, output_cr, y, hand_regions, pose_landmarks, batch
 
     if bar is not None:
         bar.finish()
@@ -1062,7 +1090,9 @@ train_dataloader, train_size = loader(csv_file=train_path[1],
                 data_stats=args.data_stats,
                 hand_stats=args.hand_stats,
                 channels=channels,
-                return_sample_ids=args.anchor_ce_weight > 0.0
+                return_sample_ids=args.anchor_ce_weight > 0.0,
+                pose_root=os.path.join(args.pose_root, 'train') if args.pose_root else None,
+                return_pose_landmarks=args.pose_fusion_mode != 'off'
                 )
 
 #No data augmentation for valid data
@@ -1081,7 +1111,9 @@ valid_dataloader, valid_size = loader(csv_file=valid_path[1],
                 hand_dir=valid_path[2],
                 data_stats=args.data_stats,
                 hand_stats=args.hand_stats,
-                channels=channels
+                channels=channels,
+                pose_root=os.path.join(args.pose_root, 'dev') if args.pose_root else None,
+                return_pose_landmarks=args.pose_fusion_mode != 'off'
                 )
 
 print('Dataset sizes:')
@@ -1124,7 +1156,8 @@ model = TRANSFORMER(tgt_vocab=vocab_size, n_stacks=args.num_layers, n_units=args
                             emb_type=args.emb_type, emb_network=args.emb_network,
                             full_pretrained=args.full_pretrained, hand_pretrained=args.hand_pretrained, freeze_cnn=args.freeze_cnn, channels=channels,
                             encoder_type=args.encoder_type, conformer_kernel_size=args.conformer_kernel_size,
-                            segment_attention_mode=args.segment_attention_mode, log_segment_stats=args.log_segment_stats)
+                            segment_attention_mode=args.segment_attention_mode, log_segment_stats=args.log_segment_stats,
+                            pose_fusion_mode=args.pose_fusion_mode)
 trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 print('model parameters:',trainable_params)
