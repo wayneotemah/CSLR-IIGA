@@ -1160,6 +1160,20 @@ def make_model(tgt_vocab, n_stacks=2, n_units=512, n_heads=10, window_size=10 , 
             ),
             2,
         )
+    elif encoder_type == 'iiga':
+        encoder = Encoder(
+            EncoderStack(
+                n_units,
+                c(attn),
+                c(ff),
+                c(seg_att),
+                dropout,
+                window_size,
+                segment_attention_mode='on',
+                log_segment_stats=log_segment_stats,
+            ),
+            n_stacks,
+        )
     elif encoder_type == 'conformer':
         encoder = Encoder(ConformerEncoderLayer(n_units, n_heads, d_ff, dropout, conformer_kernel_size), n_stacks)
     else:

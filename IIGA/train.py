@@ -460,7 +460,7 @@ parser.add_argument('--emb_type', type=str, default='2d',
 parser.add_argument('--emb_network', type=str, default='mb2',
                     help='Image embeddings network: mb2/i3d/m3d')
 
-parser.add_argument('--encoder_type', type=str, default='legacy', choices=['legacy', 'conformer'],
+parser.add_argument('--encoder_type', type=str, default='legacy', choices=['legacy', 'iiga', 'conformer'],
                     help='sequence encoder type; legacy preserves the original CSLR-IIGA encoder path')
 parser.add_argument('--conformer_kernel_size', type=int, default=17,
                     help='depthwise convolution kernel size for --encoder_type conformer; must be odd')
@@ -608,11 +608,14 @@ if args.accumulation_steps < 1:
 if args.encoder_type == 'conformer' and args.hand_query:
     parser.error('--encoder_type conformer is not supported with --hand_query in the first Conformer branch.')
 
-if args.encoder_type != 'legacy' and args.segment_attention_mode != 'on':
+if args.encoder_type != 'legacy' and args.encoder_type != 'iiga' and args.segment_attention_mode != 'on':
     parser.error('--segment_attention_mode off is only supported with --encoder_type legacy.')
 
-if args.encoder_type != 'legacy' and args.log_segment_stats:
-    parser.error('--log_segment_stats is only supported with --encoder_type legacy.')
+if args.encoder_type not in {'legacy', 'iiga'} and args.log_segment_stats:
+    parser.error('--log_segment_stats is only supported with --encoder_type legacy or iiga.')
+
+if args.encoder_type == 'iiga' and args.segment_attention_mode != 'on':
+    parser.error('--encoder_type iiga always uses the explicit local+segment path with segment attention enabled.')
 
 if args.anchor_ce_weight < 0.0:
     parser.error('--anchor_ce_weight must be non-negative.')
