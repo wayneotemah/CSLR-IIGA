@@ -6,7 +6,7 @@ import torch
 
 from dataloader import loader
 from tools.ctc_decode import decode_ctc_batch, ids_to_text
-from tools.runtime import select_device
+from tools.runtime import select_device, effective_ctc_lengths
 from tools.utils import path_data, Batch
 from transformer import make_model as TRANSFORMER
 
@@ -280,7 +280,14 @@ if __name__ == '__main__':
             if output is None:
                 raise RuntimeError("Model returned both output and output_context as None.")
             
-            decoded_preds = decode_ctc_batch(output.transpose(0, 1), x_lengths, blank_idx)
+            effective_lengths = effective_ctc_lengths(
+                x_lengths,
+                local_window=args.local_window,
+                emb_network=args.emb_network,
+                output_time=output.size(1),
+                reduction=getattr(model.src_emb, 'temporal_reduction', 1),
+            )
+            decoded_preds = decode_ctc_batch(output.transpose(0, 1), effective_lengths, blank_idx)
 
             for b, pred_ids in enumerate(decoded_preds):
 

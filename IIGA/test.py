@@ -12,7 +12,7 @@ import cv2
 from transformer import make_model as TRANSFORMER
 from dataloader import loader 
 from tools.ctc_decode import decode_ctc_batch, ids_to_text
-from tools.runtime import select_device
+from tools.runtime import select_device, effective_ctc_lengths
 from tools.utils import path_data, Batch
 
 #Progress bar to visualize training progress
@@ -435,14 +435,15 @@ for d in range(len(sizes)):
                 h = cv2.addWeighted(h, 0.5, img, 0.8, 0)
                 cv2.imwrite("samples/heatmap"+str(i)+".png", h)
 
-        i=0
-        for x_length in x_lengths:
-            if x_length % (args.local_window) != 0:
-                x_length = (args.local_window) * (x_length//(args.local_window) + 1)
-                x_lengths[i]=x_length
-            i+=1
+        effective_lengths = effective_ctc_lengths(
+            x_lengths,
+            local_window=args.local_window,
+            emb_network=args.emb_network,
+            output_time=output.size(0),
+            reduction=getattr(model.src_emb, 'temporal_reduction', 1),
+        )
 
-        x_lengths = torch.IntTensor(x_lengths)
+        x_lengths = torch.IntTensor(effective_lengths)
         y_lengths = torch.IntTensor(y_lengths)
 
         decoded_preds = decode_ctc_batch(output, x_lengths, blank_index)

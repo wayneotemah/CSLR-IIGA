@@ -16,7 +16,7 @@ from torch.optim.lr_scheduler import StepLR, MultiStepLR
 from transformer import make_model as TRANSFORMER
 from dataloader import loader
 from tools.ctc_decode import decode_ctc_batch, ids_to_text
-from tools.runtime import select_device, DeviceTelemetryPoller, format_device_telemetry
+from tools.runtime import select_device, DeviceTelemetryPoller, format_device_telemetry, effective_ctc_lengths
 from tools.offline_registry import init_offline_registry
 from tools.utils import path_data, Batch, LabelSmoothing, NoamOpt
 
@@ -882,15 +882,15 @@ def run_epoch(model, data, is_train=False, device=None, n_devices=1):
                 output_context[:, :, blank_index] -= args.ctc_blank_logit_penalty
                 output_hand[:, :, blank_index] -= args.ctc_blank_logit_penalty
 
-        i=0
-        for x_length in x_lengths:
-            if x_length % (args.local_window) != 0:
-                x_length = (args.local_window) * (x_length//(args.local_window) + 1)
-                x_lengths[i]=x_length
-            i+=1
+        effective_lengths = effective_ctc_lengths(
+            raw_x_lengths,
+            local_window=args.local_window,
+            emb_network=args.emb_network,
+            output_time=output.size(0),
+            reduction=getattr(model.src_emb, 'temporal_reduction', 1),
+        )
 
-        
-        x_lengths = torch.IntTensor(x_lengths)
+        x_lengths = torch.IntTensor(effective_lengths)
         y_lengths = torch.IntTensor(y_lengths)
 
 

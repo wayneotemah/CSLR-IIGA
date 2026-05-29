@@ -1,4 +1,5 @@
 from pathlib import Path
+import math
 import time
 
 import torch
@@ -87,6 +88,22 @@ def format_device_telemetry(telemetry):
         parts.append(f"gt_act_freq={telemetry['gt_act_freq_mhz']}MHz")
 
     return ', '.join(parts)
+
+
+def effective_ctc_lengths(raw_lengths, local_window=None, emb_network='mb2', output_time=None, reduction=None):
+    if reduction is None:
+        reduction = 2 if emb_network == 'swin3d_t' else 1
+
+    lengths = [int(math.ceil(int(length) / reduction)) for length in raw_lengths]
+
+    if local_window:
+        lengths = [((length + local_window - 1) // local_window) * local_window for length in lengths]
+
+    if output_time is not None:
+        output_time = int(output_time)
+        lengths = [min(output_time, length) for length in lengths]
+
+    return lengths
 
 
 class DeviceTelemetryPoller:

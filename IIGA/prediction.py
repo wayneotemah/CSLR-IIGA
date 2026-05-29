@@ -14,7 +14,7 @@ from torchvision import transforms
 from transformer import make_model as TRANSFORMER
 from dataloader import loader #For SLR
 from tools.ctc_decode import decode_ctc_batch, ids_to_text
-from tools.runtime import select_device
+from tools.runtime import select_device, effective_ctc_lengths
 from tools.utils import Batch
 
 
@@ -288,7 +288,15 @@ _, pred = torch.max(output, dim=-1)
 #pred = pred[pred != blank_index]
 
 
-x_lengths = torch.IntTensor(x_lengths)
+effective_lengths = effective_ctc_lengths(
+    x_lengths,
+    local_window=args.rel_window if args.rel_window is not None else None,
+    emb_network=args.emb_network,
+    output_time=output.size(0),
+    reduction=getattr(model.src_emb, 'temporal_reduction', 1),
+)
+
+x_lengths = torch.IntTensor(effective_lengths)
 y_lengths = torch.IntTensor(y_lengths)
 
 decoded_preds = decode_ctc_batch(output, x_lengths, blank_index)
