@@ -224,6 +224,7 @@ if __name__ == '__main__':
         window_size=args.local_window,
         dropout=1. - args.dp_keep_prob,
         image_size=args.rescale,
+        pretrained=False if args.emb_network == 'videomae' else True,
         emb_type=args.emb_type,
         emb_network=args.emb_network,
         channels=channels,
