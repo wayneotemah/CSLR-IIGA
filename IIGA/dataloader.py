@@ -328,12 +328,11 @@ class PhoenixDataset(Dataset):
                         assert pose_arrays is not None
                         assert pose_sample is not None
                         assert selected_pose_frame_names is not None
-                        if img not in pose_name_to_index:
-                            raise KeyError(f'Pose sidecar frame {img} not found for sample {name}')
-                        pose_idx = pose_name_to_index[img]
-                        pose_sample['pose'][i] = pose_arrays['pose'][pose_idx]
-                        pose_sample['left_hand'][i] = pose_arrays['left_hand'][pose_idx]
-                        pose_sample['right_hand'][i] = pose_arrays['right_hand'][pose_idx]
+                        pose_idx = pose_name_to_index.get(img)
+                        if pose_idx is not None:
+                            pose_sample['pose'][i] = pose_arrays['pose'][pose_idx]
+                            pose_sample['left_hand'][i] = pose_arrays['left_hand'][pose_idx]
+                            pose_sample['right_hand'][i] = pose_arrays['right_hand'][pose_idx]
                         selected_pose_frame_names.append(img)
 
                     i+=1
