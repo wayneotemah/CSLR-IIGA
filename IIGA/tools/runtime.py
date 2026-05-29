@@ -92,7 +92,7 @@ def format_device_telemetry(telemetry):
 
 def effective_ctc_lengths(raw_lengths, local_window=None, emb_network='mb2', output_time=None, reduction=None):
     if reduction is None:
-        reduction = 2 if emb_network == 'swin3d_t' else 1
+        reduction = 2 if emb_network in {'swin3d_t', 'videomae'} else 1
 
     lengths = [int(math.ceil(int(length) / reduction)) for length in raw_lengths]
 
@@ -118,8 +118,10 @@ class DeviceTelemetryPoller:
         now = time.time()
         idle_ms = telemetry.get('gt_idle_residency_ms')
         if idle_ms is not None and self._prev_time is not None and self._prev_idle_ms is not None:
+            idle_ms = int(idle_ms)
+            prev_idle_ms = int(self._prev_idle_ms)
             elapsed_ms = max((now - self._prev_time) * 1000.0, 1.0)
-            idle_delta = max(idle_ms - self._prev_idle_ms, 0)
+            idle_delta = max(idle_ms - prev_idle_ms, 0)
             busy_pct = max(0.0, min(100.0, 100.0 * (1.0 - (idle_delta / elapsed_ms))))
             telemetry['gt_busy_pct_est'] = busy_pct
 

@@ -667,6 +667,9 @@ class src_2Dembeddings(nn.Module):
         self.network_type = network_type
         self.cnn_output_units = None
         self.temporal_reduction = 1
+        self.videomae_clip_frames = None
+        self.videomae_tubelet_size = None
+        self.videomae_spatial_grid = None
 
         self.position = PositionalEncoding(n_units, 0.3)
 
@@ -716,6 +719,21 @@ class src_2Dembeddings(nn.Module):
             self.cnn_output_units = 768
             self.temporal_reduction = 2
 
+        elif self.network_type == 'videomae':
+            if channels != 3:
+                raise ValueError('videomae currently requires RGB input (channels=3)')
+            if pretrained:
+                raise RuntimeError('VideoMAE pretrained weights are not staged yet. Use pretrained=False for the first seam smoke or add a local weight-loading path first.')
+            from transformers import VideoMAEConfig, VideoMAEModel
+
+            videomae_config = VideoMAEConfig(image_size=image_size, num_frames=16)
+            self.network = VideoMAEModel(videomae_config)
+            self.cnn_output_units = videomae_config.hidden_size
+            self.temporal_reduction = videomae_config.tubelet_size
+            self.videomae_clip_frames = videomae_config.num_frames
+            self.videomae_tubelet_size = videomae_config.tubelet_size
+            self.videomae_spatial_grid = image_size // videomae_config.patch_size
+
         else:
             print('No supported architecture!!')
             quit(0)
@@ -724,7 +742,7 @@ class src_2Dembeddings(nn.Module):
         # Swin3D is consumed through its named submodules in forward(...),
         # so we must keep the model object intact instead of wrapping its
         # children into an anonymous Sequential.
-        if self.network_type != 'swin3d_t':
+        if self.network_type not in {'swin3d_t', 'videomae'}:
             modules = list(self.network.children())[:-1]
             self.network = nn.Sequential(*modules)
         self.embedding_proj = (
@@ -739,7 +757,7 @@ class src_2Dembeddings(nn.Module):
     def activations_hook(self, grad):
         self.gradients = grad
 
-    def forward(self, x):
+    def forward(self, x, src_mask=None):
 
         batch_size = x.shape[0]
         seq_len = x.shape[1]
@@ -751,6 +769,64 @@ class src_2Dembeddings(nn.Module):
             feature_map = self.network.features(feature_map)
             feature_map = self.network.norm(feature_map)
             frame_embeddings = feature_map.mean(dim=(2, 3))
+            frame_embeddings = self.embedding_proj(frame_embeddings)
+            return frame_embeddings, feature_map, self.gradients
+
+        if self.network_type == 'videomae':
+            if self.videomae_clip_frames is None or self.videomae_tubelet_size is None or self.videomae_spatial_grid is None:
+                raise RuntimeError('VideoMAE geometry was not initialized correctly.')
+
+            if src_mask is not None:
+                raw_lengths = src_mask.squeeze(1).sum(dim=-1).tolist()
+            else:
+                raw_lengths = [seq_len] * batch_size
+
+            temporal_tokens_per_clip = self.videomae_clip_frames // self.videomae_tubelet_size
+            spatial_grid = self.videomae_spatial_grid
+            hidden_size = self.cnn_output_units
+
+            sample_sequences = []
+            feature_maps = []
+
+            for i in range(batch_size):
+                valid_len = max(1, int(raw_lengths[i]))
+                valid_video = x[i, :valid_len]
+                clips = []
+                valid_tubelets = []
+
+                for start in range(0, valid_len, self.videomae_clip_frames):
+                    clip = valid_video[start:start + self.videomae_clip_frames]
+                    valid_frames = clip.shape[0]
+                    valid_tubelets.append(int(math.ceil(valid_frames / self.videomae_tubelet_size)))
+                    if valid_frames < self.videomae_clip_frames:
+                        pad = clip.new_zeros((self.videomae_clip_frames - valid_frames, clip.shape[1], clip.shape[2], clip.shape[3]))
+                        clip = torch.cat((clip, pad), dim=0)
+                    clips.append(clip)
+
+                clip_batch = torch.stack(clips, dim=0)
+                clip_outputs = self.network(pixel_values=clip_batch).last_hidden_state
+                clip_outputs = clip_outputs.view(clip_batch.shape[0], temporal_tokens_per_clip, spatial_grid, spatial_grid, hidden_size)
+                clip_temporal = clip_outputs.mean(dim=(2, 3))
+
+                temporal_chunks = []
+                clip_feature_maps = []
+                for j, keep_len in enumerate(valid_tubelets):
+                    temporal_chunks.append(clip_temporal[j, :keep_len])
+                    clip_feature_maps.append(clip_outputs[j, :keep_len])
+
+                sample_seq = torch.cat(temporal_chunks, dim=0)
+                sample_feature_map = torch.cat(clip_feature_maps, dim=0)
+                sample_sequences.append(sample_seq)
+                feature_maps.append(sample_feature_map)
+
+            max_tokens = max(sequence.shape[0] for sequence in sample_sequences)
+            frame_embeddings = x.new_zeros((batch_size, max_tokens, hidden_size))
+            feature_map = x.new_zeros((batch_size, max_tokens, spatial_grid, spatial_grid, hidden_size))
+
+            for i, sequence in enumerate(sample_sequences):
+                frame_embeddings[i, :sequence.shape[0]] = sequence
+                feature_map[i, :feature_maps[i].shape[0]] = feature_maps[i]
+
             frame_embeddings = self.embedding_proj(frame_embeddings)
             return frame_embeddings, feature_map, self.gradients
 
@@ -839,6 +915,9 @@ class EncoderStack(nn.Module):
 
         proposal_project_mask = torch.zeros((batch_size, temp_len, max_segments_number), dtype=torch.float32).to(x)
         inter_attn_mask = torch.zeros((batch_size, max_segments_number, max_segments_number), dtype=torch.float32).to(x)
+
+        if mask is None:
+            raise RuntimeError('EncoderStack requires a valid src mask for local/segment attention.')
 
         proposal_count_by_video=[]
         for i in range(batch_size):
@@ -1023,7 +1102,7 @@ class FullTransformer(nn.Module):
             rel_mask = src_mask
 
         #Get context seq emb
-        src_emb, f_map, grad = self.src_emb(src)
+        src_emb, f_map, grad = self.src_emb(src, src_mask)
 
         if src_mask is not None and src_mask.shape[-1] != src_emb.size(1):
             src_mask = F.interpolate(src_mask.to(src_emb.dtype), size=src_emb.size(1), mode='nearest').bool()
