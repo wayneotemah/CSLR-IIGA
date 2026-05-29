@@ -6,7 +6,6 @@
 
 from __future__ import print_function, division
 import os
-from re import T
 import torch
 import pandas as pd
 import numpy as np
@@ -52,9 +51,9 @@ def resize_frame_image(image, size):
     if cv2 is not None:
         return cv2.resize(image, size)
 
-    return np.asarray(Image.fromarray(image).resize(size, Image.BILINEAR))
+    return np.asarray(Image.fromarray(image).resize(size, Image.Resampling.BILINEAR))
 
-def collate_fn(data, fixed_padding=None, pad_index=0, return_sample_ids=False):
+def collate_fn(data, fixed_padding=None, pad_index=0, return_sample_ids=False, return_pose_landmarks=False):
     """Creates mini-batch tensors w/ same length sequences by performing padding to the sequecenses.
     We should build a custom collate_fn to merge sequences w/ padding (not supported in default).
     Seqeuences are padded to the maximum length of mini-batch sequences (dynamic padding), else pad
@@ -78,7 +77,6 @@ def collate_fn(data, fixed_padding=None, pad_index=0, return_sample_ids=False):
             #(seq_length, channels, n_h, n_w)
             seq_shape = sequences[0].shape
             if(fixed_padding):
-                padded_seqs = fixed_padding
                 padded_seqs = torch.zeros(len(sequences), fixed_padding, seq_shape[1], seq_shape[2], seq_shape[3]).type_as(sequences[0])
             else:
                 padded_seqs = torch.zeros(len(sequences), max(lengths), seq_shape[1], seq_shape[2], seq_shape[3]).type_as(sequences[0])
@@ -86,6 +84,8 @@ def collate_fn(data, fixed_padding=None, pad_index=0, return_sample_ids=False):
         #For sequence of words
         elif(t=='target'):
             padded_seqs = np.full((len(sequences), max(lengths)), fill_value=pad_index, dtype=np.int64)
+        else:
+            raise ValueError(f'Unknown pad type: {t}')
 
         for i, seq in enumerate(sequences):
             end = lengths[i]
@@ -96,8 +96,9 @@ def collate_fn(data, fixed_padding=None, pad_index=0, return_sample_ids=False):
     src_seqs = []
     trg_seqs = []
     right_hands = []
-    left_hands = []
     sample_ids = []
+    pose_seqs = []
+    pose_frame_names = []
 
     for element in data:
         src_seqs.append(element['images'])
@@ -106,20 +107,59 @@ def collate_fn(data, fixed_padding=None, pad_index=0, return_sample_ids=False):
         right_hands.append(element['right_hands'])
         if return_sample_ids:
             sample_ids.append(str(element['sample_id']))
+        if return_pose_landmarks:
+            pose_seqs.append(element['pose_landmarks'])
+            pose_frame_names.append(element['pose_frame_names'])
 
     #pad sequences
     src_seqs, src_lengths = pad(src_seqs, 'source')
     trg_seqs, trg_lengths = pad(trg_seqs, 'target')
 
     #pad hand sequences
-    if(type(right_hands[0]) != type(None)):
+    if right_hands[0] is not None:
         hand_seqs, hand_lengths = pad(right_hands, 'source')
     else:
         hand_seqs = None
         hand_lengths = None
 
+    pose_batch = None
+    if return_pose_landmarks:
+        pose_batch = {
+            'pose': None,
+            'left_hand': None,
+            'right_hand': None,
+            'frame_names': pose_frame_names,
+        }
+
+        if pose_seqs and pose_seqs[0] is not None:
+            batch_size = len(pose_seqs)
+            max_len = src_seqs.shape[1]
+
+            pose_shape = pose_seqs[0]['pose'].shape[1:]
+            left_shape = pose_seqs[0]['left_hand'].shape[1:]
+            right_shape = pose_seqs[0]['right_hand'].shape[1:]
+
+            pose_tensor = torch.zeros((batch_size, max_len) + pose_shape, dtype=pose_seqs[0]['pose'].dtype)
+            left_tensor = torch.zeros((batch_size, max_len) + left_shape, dtype=pose_seqs[0]['left_hand'].dtype)
+            right_tensor = torch.zeros((batch_size, max_len) + right_shape, dtype=pose_seqs[0]['right_hand'].dtype)
+
+            for i, pose_seq in enumerate(pose_seqs):
+                length = pose_seq['pose'].shape[0]
+                pose_tensor[i, :length] = pose_seq['pose']
+                left_tensor[i, :length] = pose_seq['left_hand']
+                right_tensor[i, :length] = pose_seq['right_hand']
+
+            pose_batch['pose'] = pose_tensor
+            pose_batch['left_hand'] = left_tensor
+            pose_batch['right_hand'] = right_tensor
+
     if return_sample_ids:
+        if return_pose_landmarks:
+            return src_seqs, src_lengths, trg_seqs, trg_lengths, hand_seqs, hand_lengths, pose_batch, sample_ids
         return src_seqs, src_lengths, trg_seqs, trg_lengths, hand_seqs, hand_lengths, sample_ids
+
+    if return_pose_landmarks:
+        return src_seqs, src_lengths, trg_seqs, trg_lengths, hand_seqs, hand_lengths, pose_batch
 
     return src_seqs, src_lengths, trg_seqs, trg_lengths, hand_seqs, hand_lengths
 
@@ -128,13 +168,14 @@ def collate_fn(data, fixed_padding=None, pad_index=0, return_sample_ids=False):
 class PhoenixDataset(Dataset):
     """Sequential Sign language images dataset."""
 
-    def __init__(self, csv_file, root_dir, segment_path, lookup_table, random_drop, uniform_drop, istrain, transform=None,rescale=224, sos_index=1, eos_index=2, unk_index=0, fixed_padding=None, hand_dir=None, hand_transform=None, channels=3, return_sample_ids=False):
+    def __init__(self, csv_file, root_dir, segment_path, lookup_table, random_drop, uniform_drop, istrain, transform=None,rescale=224, sos_index=1, eos_index=2, unk_index=0, fixed_padding=None, hand_dir=None, hand_transform=None, channels=3, return_sample_ids=False, pose_root=None, return_pose_landmarks=False):
 
         #Get data
         self.annotations = pd.read_csv(csv_file, header=None)
         self.root_dir = root_dir
         self.segment_path= segment_path
         self.hand_dir = hand_dir
+        self.pose_root = pose_root
         self.random_drop = random_drop
         self.uniform_drop = uniform_drop
         self.transform = transform
@@ -144,6 +185,7 @@ class PhoenixDataset(Dataset):
 
         self.channels = channels
         self.return_sample_ids = return_sample_ids
+        self.return_pose_landmarks = return_pose_landmarks
 
         #index used for eos token and unk
         self.eos_index = eos_index
@@ -171,6 +213,9 @@ class PhoenixDataset(Dataset):
         segments_name= os.path.join(self.segment_path, name)
         trsf_images = None
         hand_images = None
+        pose_sample = None
+        selected_pose_frame_names = None
+        hand_path = None
 
         for path, d, files in os.walk(seq_name):
             images = sorted(
@@ -205,6 +250,31 @@ class PhoenixDataset(Dataset):
             #Save the images of seq
             
             i=0
+
+            pose_name_to_index = None
+            pose_arrays = None
+            if self.return_pose_landmarks:
+                if self.pose_root is None:
+                    raise RuntimeError('return_pose_landmarks=True requires pose_root to be set')
+                pose_dir = os.path.join(self.pose_root, name, '1')
+                pose_path = os.path.join(pose_dir, 'landmarks.npz')
+                if not os.path.exists(pose_path):
+                    raise FileNotFoundError(pose_path)
+                pose_npz = np.load(pose_path, allow_pickle=True)
+                pose_lookup_frame_names = [str(frame_name) for frame_name in pose_npz['frame_names'].tolist()]
+                pose_name_to_index = {frame_name: j for j, frame_name in enumerate(pose_lookup_frame_names)}
+                pose_arrays = {
+                    'pose': torch.from_numpy(pose_npz['pose']).float(),
+                    'left_hand': torch.from_numpy(pose_npz['left_hand']).float(),
+                    'right_hand': torch.from_numpy(pose_npz['right_hand']).float(),
+                }
+                pose_sample = {
+                    'pose': torch.zeros((seq_length,) + tuple(pose_arrays['pose'].shape[1:]), dtype=pose_arrays['pose'].dtype),
+                    'left_hand': torch.zeros((seq_length,) + tuple(pose_arrays['left_hand'].shape[1:]), dtype=pose_arrays['left_hand'].dtype),
+                    'right_hand': torch.zeros((seq_length,) + tuple(pose_arrays['right_hand'].shape[1:]), dtype=pose_arrays['right_hand'].dtype),
+                }
+                selected_pose_frame_names = []
+
             for ind in indexs:
                 
                     img=images[ind]
@@ -234,18 +304,38 @@ class PhoenixDataset(Dataset):
 
 
                     if(self.hand_dir):
+                        assert hand_path is not None
+                        assert hand_images is not None
+                        assert self.hand_transform is not None
                         hand_name_0 = os.path.join(hand_path, 'images'+'{:04d}'.format(ind)+'.png')
-
-                        if(io.imread(hand_name_0).shape[2] == self.channels):
-                            hand_images[i-1] = self.hand_transform(io.imread(hand_name_0))
+                        hand_image = io.imread(hand_name_0)
+                        if hand_image.ndim == 2:
+                            hand_image = np.repeat(hand_image[..., np.newaxis], self.channels, axis=2)
+                        if(hand_image.shape[2] == self.channels):
+                            hand_images[i-1] = self.hand_transform(hand_image)
                         else:
-                            hand_images[i-1] = self.hand_transform(io.imread(hand_name_0)[:, :, :self.channels])
+                            hand_images[i-1] = self.hand_transform(hand_image[:, :, :self.channels])
 
                     #NOTE: some images got shape of (260, 220, 4)
+                    assert self.transform is not None
                     if annotated_image.shape[2] == self.channels:
                         trsf_images[i] = self.transform(annotated_image)
                     else:
                         trsf_images[i] = self.transform(annotated_image[:, :, :self.channels])
+
+                    if self.return_pose_landmarks:
+                        assert pose_name_to_index is not None
+                        assert pose_arrays is not None
+                        assert pose_sample is not None
+                        assert selected_pose_frame_names is not None
+                        if img not in pose_name_to_index:
+                            raise KeyError(f'Pose sidecar frame {img} not found for sample {name}')
+                        pose_idx = pose_name_to_index[img]
+                        pose_sample['pose'][i] = pose_arrays['pose'][pose_idx]
+                        pose_sample['left_hand'][i] = pose_arrays['left_hand'][pose_idx]
+                        pose_sample['right_hand'][i] = pose_arrays['right_hand'][pose_idx]
+                        selected_pose_frame_names.append(img)
+
                     i+=1
 
         if trsf_images is None:
@@ -273,6 +363,11 @@ class PhoenixDataset(Dataset):
         sample = {'images': trsf_images, 'right_hands':hand_images, 'translation': trans}
         if self.return_sample_ids:
             sample['sample_id'] = str(name)
+        if self.return_pose_landmarks:
+            assert pose_sample is not None
+            assert selected_pose_frame_names is not None
+            sample['pose_landmarks'] = pose_sample
+            sample['pose_frame_names'] = selected_pose_frame_names
         return sample
 
 
@@ -282,8 +377,6 @@ def show_batch(sample_batched):
 
     images_batch, images_length, trans_batch, trans_length = \
             sample_batched
-    batch_size = len(images_batch)
-    im_size = images_batch.size(2)
 
     #Show only one sequence of the batch
     grid = utils.make_grid(images_batch[0, :images_length[0]])
@@ -311,7 +404,15 @@ class SubtractMeans(object):
         return image
 
 
-def loader(csv_file, root_dir, segment_path, lookup, rescale, batch_size, num_workers, random_drop, uniform_drop, show_sample, istrain=False, mean_path='FulFrame_Mean_Image_227x227.npy', fixed_padding=None, hand_dir=None, data_stats=None, hand_stats=None, channels=3, return_sample_ids=False):
+def loader(csv_file, root_dir, segment_path, lookup, rescale, batch_size, num_workers, random_drop, uniform_drop, show_sample, istrain=False, mean_path='FulFrame_Mean_Image_227x227.npy', fixed_padding=None, hand_dir=None, data_stats=None, hand_stats=None, channels=3, return_sample_ids=False, pose_root=None, return_pose_landmarks=False):
+
+    def batch_collate_with_options(batch):
+        return collate_fn(
+            batch,
+            fixed_padding=fixed_padding,
+            return_sample_ids=return_sample_ids,
+            return_pose_landmarks=return_pose_landmarks,
+        )
 
     #Note: when using random cropping, this with reshape images with randomCrop size instead of rescale
     if(istrain):
@@ -408,14 +509,19 @@ def loader(csv_file, root_dir, segment_path, lookup, rescale, batch_size, num_wo
                                             hand_dir=hand_dir,
                                             hand_transform=hand_trans,
                                             channels = channels,
-                                            return_sample_ids=return_sample_ids
+                                            return_sample_ids=return_sample_ids,
+                                            pose_root=pose_root,
+                                            return_pose_landmarks=return_pose_landmarks,
                                             )
 
     size = len(transformed_dataset)
 
     #Iterate in batches
     #Note: put num of workers to 0 to avoid memory saturation
-    batch_collate = (lambda batch: collate_fn(batch, return_sample_ids=True)) if return_sample_ids else collate_fn
+    if return_sample_ids or return_pose_landmarks:
+        batch_collate = batch_collate_with_options
+    else:
+        batch_collate = collate_fn
     dataloader = DataLoader(transformed_dataset, batch_size=batch_size,
                             shuffle=True, num_workers=num_workers, collate_fn=batch_collate)
 
