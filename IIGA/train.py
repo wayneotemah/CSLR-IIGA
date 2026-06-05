@@ -558,6 +558,69 @@ def empty_token_presence_metrics():
         'margin_count': 0,
     }
 
+
+def pool_clip_representations(src_emb_btd, effective_lengths):
+    max_time = src_emb_btd.size(1)
+    device = src_emb_btd.device
+    lengths = torch.as_tensor(effective_lengths, device=device)
+    frame_index = torch.arange(max_time, device=device).unsqueeze(0)
+    valid_mask = frame_index < lengths.unsqueeze(1)
+    valid_mask = valid_mask.unsqueeze(-1).to(src_emb_btd.dtype)
+    summed = (src_emb_btd * valid_mask).sum(dim=1)
+    denom = valid_mask.sum(dim=1).clamp_min(1.0)
+    return summed / denom
+
+
+def compute_anti_collapse_loss(src_emb_btd, effective_lengths):
+    clip_repr = pool_clip_representations(src_emb_btd, effective_lengths)
+    if clip_repr.size(0) < 2:
+        return None, None
+    clip_repr = F.normalize(clip_repr, dim=-1)
+    sim = torch.matmul(clip_repr, clip_repr.transpose(0, 1))
+    upper = torch.triu_indices(sim.size(0), sim.size(1), offset=1, device=sim.device)
+    pair_sims = sim[upper[0], upper[1]]
+    if pair_sims.numel() == 0:
+        return None, None
+    return pair_sims.mean(), pair_sims
+
+
+def empty_anti_collapse_metrics():
+    return {
+        'pair_count': 0,
+        'similarity_sum': 0.0,
+        'similarity_max': None,
+        'similarity_min': None,
+    }
+
+
+def update_anti_collapse_metrics(running, pair_sims):
+    if pair_sims is None:
+        return
+    sims = pair_sims.detach().cpu()
+    running['pair_count'] += int(sims.numel())
+    running['similarity_sum'] += float(sims.sum().item())
+    batch_max = float(sims.max().item())
+    batch_min = float(sims.min().item())
+    running['similarity_max'] = batch_max if running['similarity_max'] is None else max(running['similarity_max'], batch_max)
+    running['similarity_min'] = batch_min if running['similarity_min'] is None else min(running['similarity_min'], batch_min)
+
+
+def finalize_anti_collapse_metrics(running):
+    pair_count = running['pair_count']
+    if pair_count == 0:
+        return {
+            'pair_count': 0,
+            'mean_similarity': 0.0,
+            'max_similarity': 0.0,
+            'min_similarity': 0.0,
+        }
+    return {
+        'pair_count': pair_count,
+        'mean_similarity': running['similarity_sum'] / pair_count,
+        'max_similarity': running['similarity_max'],
+        'min_similarity': running['similarity_min'],
+    }
+
 # parser helper for optional probabilities in [0, 1]
 def optional_probability(value):
     if value is None:
@@ -817,6 +880,8 @@ parser.add_argument('--token_presence_pool', type=str, default='logsumexp', choi
                     help='Pooling mode over time for token presence evidence.')
 parser.add_argument('--token_presence_margin', type=float, default=0.2,
                     help='Margin used by the token presence ranking loss.')
+parser.add_argument('--anti_collapse_weight', type=float, default=0.0,
+                    help='Weight for optional pairwise anti-collapse penalty over pooled clip representations.')
 
 
 #----------------------------------------------------------------------------------------
@@ -877,6 +942,9 @@ if args.token_presence_negative_count < 1:
 
 if args.token_presence_margin < 0.0:
     parser.error('--token_presence_margin must be non-negative.')
+
+if args.anti_collapse_weight < 0.0:
+    parser.error('--anti_collapse_weight must be non-negative.')
 
 if args.token_presence_rank_weight > 0.0:
     if args.hand_query:
@@ -959,6 +1027,9 @@ def run_epoch(model, data, is_train=False, device=None, n_devices=1):
     token_presence_running = empty_token_presence_metrics()
     token_presence_loss_total = 0.0
     token_presence_loss_count = 0
+    anti_collapse_running = empty_anti_collapse_metrics()
+    anti_collapse_loss_total = 0.0
+    anti_collapse_loss_count = 0
 
     gt = []
     hyp = []
@@ -1163,6 +1234,8 @@ def run_epoch(model, data, is_train=False, device=None, n_devices=1):
         #print(output.shape)
         #print(y.shape)
         token_presence_loss = None
+        anti_collapse_loss = None
+        anti_collapse_pair_sims = None
         if args.token_presence_rank_weight > 0.0:
             pooled_scores = pool_token_presence_scores(
                 output_context,
@@ -1190,6 +1263,10 @@ def run_epoch(model, data, is_train=False, device=None, n_devices=1):
                 margin=args.token_presence_margin,
             )
 
+        if args.anti_collapse_weight > 0.0:
+            anti_collapse_loss, anti_collapse_pair_sims = compute_anti_collapse_loss(output_context, effective_lengths)
+            update_anti_collapse_metrics(anti_collapse_running, anti_collapse_pair_sims)
+
         if output_cr is not None:
             ctc_loss_a = ctc_loss(output, y.cpu(), x_lengths.cpu(), y_lengths.cpu())
             ctc_loss_b = ctc_loss(output_cr, y.cpu(), x_lengths.cpu(), y_lengths.cpu())
@@ -1210,6 +1287,11 @@ def run_epoch(model, data, is_train=False, device=None, n_devices=1):
             loss = loss + args.token_presence_rank_weight * token_presence_loss
             token_presence_loss_total += token_presence_loss.detach().item()
             token_presence_loss_count += 1
+
+        if anti_collapse_loss is not None and torch.isfinite(anti_collapse_loss):
+            loss = loss + args.anti_collapse_weight * anti_collapse_loss
+            anti_collapse_loss_total += anti_collapse_loss.detach().item()
+            anti_collapse_loss_count += 1
 
         if(args.hand_query):
             loss += ctc_loss(output_context, y.cpu(), x_lengths.cpu(), y_lengths.cpu())
@@ -1289,6 +1371,17 @@ def run_epoch(model, data, is_train=False, device=None, n_devices=1):
                             live_presence['mean_margin'],
                         )
                     )
+                if args.anti_collapse_weight > 0.0:
+                    live_anticollapse = finalize_anti_collapse_metrics(anti_collapse_running)
+                    print(
+                        "Anti-collapse: avg_loss=%.6f, pair_count=%d, mean_sim=%.4f, min_sim=%.4f, max_sim=%.4f" % (
+                            (anti_collapse_loss_total / anti_collapse_loss_count) if anti_collapse_loss_count else 0.0,
+                            live_anticollapse['pair_count'],
+                            live_anticollapse['mean_similarity'],
+                            live_anticollapse['min_similarity'],
+                            live_anticollapse['max_similarity'],
+                        )
+                    )
                 if args.anchor_ce_weight > 0.0:
                     if last_anchor_ce is None:
                         print("Anchor CE: skipped, Anchors: 0")
@@ -1307,7 +1400,7 @@ def run_epoch(model, data, is_train=False, device=None, n_devices=1):
 
         #Free some memory
         #NOTE: this helps alot in avoiding cuda out of memory
-        del loss, output, output_context, output_hand, output_interctc, output_visual_ctc, output_context_cr, output_cr, token_presence_loss, y, hand_regions, pose_landmarks, batch
+        del loss, output, output_context, output_hand, output_interctc, output_visual_ctc, output_context_cr, output_cr, token_presence_loss, anti_collapse_loss, anti_collapse_pair_sims, y, hand_regions, pose_landmarks, batch
 
     if bar is not None:
         bar.finish()
@@ -1317,14 +1410,14 @@ def run_epoch(model, data, is_train=False, device=None, n_devices=1):
 
     if(is_train):
         print("Average Loss: %f" %(total_loss.item() / total_tokens.item()))
-        return total_loss.item() / total_tokens.item(), finalize_token_presence_metrics(token_presence_running), ((token_presence_loss_total / token_presence_loss_count) if token_presence_loss_count else 0.0)
+        return total_loss.item() / total_tokens.item(), finalize_token_presence_metrics(token_presence_running), ((token_presence_loss_total / token_presence_loss_count) if token_presence_loss_count else 0.0), finalize_anti_collapse_metrics(anti_collapse_running), ((anti_collapse_loss_total / anti_collapse_loss_count) if anti_collapse_loss_count else 0.0)
 
     else:
         #Measure WER of all dataset
         print('Measuring WER..')
         print("Average WER: %f" %(total_wer_score/count))
 
-        return total_loss.item() / total_tokens.item(), total_wer_score/count, finalize_token_presence_metrics(token_presence_running), ((token_presence_loss_total / token_presence_loss_count) if token_presence_loss_count else 0.0)
+        return total_loss.item() / total_tokens.item(), total_wer_score/count, finalize_token_presence_metrics(token_presence_running), ((token_presence_loss_total / token_presence_loss_count) if token_presence_loss_count else 0.0), finalize_anti_collapse_metrics(anti_collapse_running), ((anti_collapse_loss_total / anti_collapse_loss_count) if anti_collapse_loss_count else 0.0)
 #-------------------------------------------------------------------------------------------------------
 
 ### LOAD DATALOADERS
@@ -1591,7 +1684,7 @@ for epoch in range(start_epoch, num_epochs):
     #print('LR',scheduler.get_lr())
     print(current_learning_rate(optimizer))
     # RUN MODEL ON TRAINING DATA
-    train_loss, train_presence_metrics, train_presence_loss = run_epoch(model, train_dataloader, True, device=device)
+    train_loss, train_presence_metrics, train_presence_loss, train_anticollapse_metrics, train_anticollapse_loss = run_epoch(model, train_dataloader, True, device=device)
     print("After train epoch..")
     print_device_utilization(device)
 
@@ -1610,7 +1703,7 @@ for epoch in range(start_epoch, num_epochs):
         #RUN MODEL ON VALIDATION DATA
         #NOTE: Helps with avoiding memory saturation
         with torch.no_grad():
-            val_loss, word_err, valid_presence_metrics, valid_presence_loss = run_epoch(model, valid_dataloader, device=device)
+            val_loss, word_err, valid_presence_metrics, valid_presence_loss, valid_anticollapse_metrics, valid_anticollapse_loss = run_epoch(model, valid_dataloader, device=device)
 
             if word_err < best_err_so_far:
                 best_err_so_far = word_err
@@ -1682,6 +1775,20 @@ for epoch in range(start_epoch, num_epochs):
                 'valid/token_presence_mean_margin': float(valid_presence_metrics['mean_margin']),
                 'valid/token_presence_target_count': int(valid_presence_metrics['target_count']),
             })
+
+        if args.anti_collapse_weight > 0.0:
+            epoch_metrics.update({
+                'train/anti_collapse_loss': float(train_anticollapse_loss),
+                'train/anti_collapse_pair_count': int(train_anticollapse_metrics['pair_count']),
+                'train/anti_collapse_mean_similarity': float(train_anticollapse_metrics['mean_similarity']),
+                'train/anti_collapse_min_similarity': float(train_anticollapse_metrics['min_similarity']),
+                'train/anti_collapse_max_similarity': float(train_anticollapse_metrics['max_similarity']),
+                'valid/anti_collapse_loss': float(valid_anticollapse_loss),
+                'valid/anti_collapse_pair_count': int(valid_anticollapse_metrics['pair_count']),
+                'valid/anti_collapse_mean_similarity': float(valid_anticollapse_metrics['mean_similarity']),
+                'valid/anti_collapse_min_similarity': float(valid_anticollapse_metrics['min_similarity']),
+                'valid/anti_collapse_max_similarity': float(valid_anticollapse_metrics['max_similarity']),
+            })
         log_wandb(wandb_run, epoch_metrics)
         if offline_registry is not None:
             try:
@@ -1704,6 +1811,21 @@ for epoch in range(start_epoch, num_epochs):
                         + 'valid top10: ' + str(valid_presence_metrics['top10_count']) + '/' + str(valid_presence_metrics['target_count']) + '\t'
                         + 'valid mean rank: ' + str(valid_presence_metrics['mean_rank']) + '\t'
                         + 'valid mean margin: ' + str(valid_presence_metrics['mean_margin']) + '\n'
+                    )
+
+                if args.anti_collapse_weight > 0.0:
+                    f_.write(
+                        'anti collapse:\t'
+                        + 'train loss: ' + str(train_anticollapse_loss) + '\t'
+                        + 'train pairs: ' + str(train_anticollapse_metrics['pair_count']) + '\t'
+                        + 'train mean sim: ' + str(train_anticollapse_metrics['mean_similarity']) + '\t'
+                        + 'train min sim: ' + str(train_anticollapse_metrics['min_similarity']) + '\t'
+                        + 'train max sim: ' + str(train_anticollapse_metrics['max_similarity']) + '\t'
+                        + 'valid loss: ' + str(valid_anticollapse_loss) + '\t'
+                        + 'valid pairs: ' + str(valid_anticollapse_metrics['pair_count']) + '\t'
+                        + 'valid mean sim: ' + str(valid_anticollapse_metrics['mean_similarity']) + '\t'
+                        + 'valid min sim: ' + str(valid_anticollapse_metrics['min_similarity']) + '\t'
+                        + 'valid max sim: ' + str(valid_anticollapse_metrics['max_similarity']) + '\n'
                     )
 
 
