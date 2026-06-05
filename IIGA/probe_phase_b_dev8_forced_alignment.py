@@ -104,18 +104,33 @@ def per_token_support(log_probs_tbv, target_ids, vocab_inv, blank_idx):
     return rows
 
 
-def run_probe_for_row(row, args, device, lookup, vocab_inv, model):
+def split_roots(prepared_root: Path, split: str) -> tuple[str, str]:
+    train_path, dev_path, test_path = path_data(
+        data_path=str(prepared_root),
+        task='SLR',
+        features_type='features',
+        hand_query=False,
+    )
+    roots = {
+        'train': (train_path[0], str(prepared_root / 'segmentation' / 'train_segmentation')),
+        'dev': (dev_path[0], str(prepared_root / 'segmentation' / 'val_segmentation')),
+        'test': (test_path[0], str(prepared_root / 'segmentation' / 'test_segmentation')),
+    }
+    return roots[split]
+
+
+def run_probe_for_row(row, split, args, device, lookup, vocab_inv, model):
     blank_idx = lookup.get('<BLANK>', len(lookup) - 1)
     pad_idx = lookup.get('<PAD>', 0)
 
     with tempfile.TemporaryDirectory(prefix='dev8_align_') as tmpdir:
         tmp_csv = Path(tmpdir) / 'single.corpus.csv'
         write_single_row_csv(row, tmp_csv)
-        train_path, _, _ = path_data(data_path=args.prepared_root, task='SLR', features_type='features', hand_query=False)
+        root_dir, segment_root = split_roots(Path(args.prepared_root), split)
         dataloader, _ = loader(
             csv_file=str(tmp_csv),
-            root_dir=train_path[0],
-            segment_path=args.segment_root,
+            root_dir=root_dir,
+            segment_path=segment_root,
             lookup=args.lookup_table,
             rescale=args.rescale,
             batch_size=1,
@@ -203,7 +218,6 @@ def main() -> None:
     parser.add_argument('--prepared_root', required=True)
     parser.add_argument('--checkpoint', required=True)
     parser.add_argument('--lookup_table', required=True)
-    parser.add_argument('--segment_root', required=True)
     parser.add_argument('--output_json', required=True)
     parser.add_argument('--rescale', type=int, default=224)
     parser.add_argument('--hidden_size', type=int, default=256)
@@ -218,7 +232,10 @@ def main() -> None:
     args = parser.parse_args()
 
     prepared_root = Path(args.prepared_root)
-    rows = read_corpus_rows(prepared_root / 'annotations' / 'manual' / 'dev.corpus.csv')
+    rows_by_split = {
+        split: read_corpus_rows(prepared_root / 'annotations' / 'manual' / f'{split}.corpus.csv')
+        for split in ('train', 'dev', 'test')
+    }
 
     with open(args.lookup_table, 'rb') as handle:
         lookup = pickle.load(handle)
@@ -226,7 +243,10 @@ def main() -> None:
     device = select_device()
     model = build_model(args, len(lookup), device)
 
-    results = [run_probe_for_row(row, args, device, lookup, vocab_inv, model) for row in rows]
+    results = [
+        run_probe_for_row(row, 'dev', args, device, lookup, vocab_inv, model)
+        for row in rows_by_split['dev']
+    ]
     alignment_ok_rows = [row['sample_id'] for row in results if row['alignment_ok']]
     all_supported_rows = [row['sample_id'] for row in results if row['all_tokens_supported_top5_prob001']]
     partial_supported_rows = [
@@ -240,7 +260,11 @@ def main() -> None:
         'prepared_root': str(prepared_root),
         'checkpoint': args.checkpoint,
         'lookup_table': args.lookup_table,
-        'segment_root': args.segment_root,
+        'segment_roots': {
+            'train': str(prepared_root / 'segmentation' / 'train_segmentation'),
+            'dev': str(prepared_root / 'segmentation' / 'val_segmentation'),
+            'test': str(prepared_root / 'segmentation' / 'test_segmentation'),
+        },
         'device': str(device),
         'alignment_ok_rows': alignment_ok_rows,
         'all_supported_rows': all_supported_rows,
