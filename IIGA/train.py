@@ -219,6 +219,29 @@ def read_corpus_ids(csv_path):
     return ids
 
 
+def load_corpus_rows(csv_path):
+    rows = []
+    if not csv_path or not os.path.exists(csv_path):
+        return rows
+
+    with open(csv_path, 'r', encoding='utf-8') as handle:
+        for line in handle:
+            raw = line.strip()
+            if not raw:
+                continue
+            parts = raw.split('|')
+            if len(parts) < 3:
+                continue
+            sample_id, target = parts[0], parts[1]
+            rows.append({
+                'sample_id': sample_id,
+                'target': target,
+                'tokens': target.split(),
+            })
+
+    return rows
+
+
 def _first_present(mapping, keys):
     for key in keys:
         if key in mapping:
@@ -349,6 +372,191 @@ def compute_anchor_ce(output_context, sample_ids, raw_x_lengths, anchor_map_by_s
 
     anchor_loss = torch.stack(losses).sum() / len(losses)
     return anchor_loss, len(losses)
+
+
+def collect_target_token_ids(y, y_lengths, excluded_ids):
+    targets = []
+    excluded_ids = set(excluded_ids)
+    for batch_idx in range(y.size(0)):
+        valid = y[batch_idx, : int(y_lengths[batch_idx])].tolist()
+        unique_ids = []
+        seen = set()
+        for token_id in valid:
+            if token_id in excluded_ids or token_id in seen:
+                continue
+            seen.add(token_id)
+            unique_ids.append(token_id)
+        targets.append(unique_ids)
+    return targets
+
+
+def pool_token_presence_scores(output_context_btv, effective_lengths, pool_mode):
+    max_time = output_context_btv.size(1)
+    device = output_context_btv.device
+    lengths = torch.as_tensor(effective_lengths, device=device)
+    frame_index = torch.arange(max_time, device=device).unsqueeze(0)
+    valid_mask = frame_index < lengths.unsqueeze(1)
+    masked = output_context_btv.masked_fill(~valid_mask.unsqueeze(-1), float('-inf'))
+    if pool_mode == 'max':
+        return masked.max(dim=1).values
+    if pool_mode == 'logsumexp':
+        return torch.logsumexp(masked, dim=1)
+    raise ValueError(f'Unsupported token presence pool mode: {pool_mode}')
+
+
+def select_presence_negative_ids(score_row, positive_ids, negative_count, excluded_ids):
+    score_row = score_row.detach()
+    vocab_size = score_row.size(0)
+    forbidden = set(positive_ids) | set(excluded_ids)
+    candidate_ids = [token_id for token_id in range(vocab_size) if token_id not in forbidden]
+    if not candidate_ids:
+        return []
+    candidate_scores = score_row[candidate_ids]
+    hard_k = min(negative_count, len(candidate_ids))
+    if hard_k <= 0:
+        return []
+    top_indices = torch.topk(candidate_scores, k=hard_k).indices.tolist()
+    return [candidate_ids[idx] for idx in top_indices]
+
+
+def compute_token_presence_rank_loss(
+    pooled_scores,
+    target_token_ids,
+    excluded_ids,
+    negative_count,
+    margin,
+):
+    losses = []
+    for batch_idx, positive_ids in enumerate(target_token_ids):
+        if not positive_ids:
+            continue
+        negative_ids = select_presence_negative_ids(
+            pooled_scores[batch_idx],
+            positive_ids,
+            negative_count=negative_count,
+            excluded_ids=excluded_ids,
+        )
+        if not negative_ids:
+            continue
+        positive_scores = pooled_scores[batch_idx, positive_ids]
+        negative_scores = pooled_scores[batch_idx, negative_ids]
+        pairwise_margin = margin - positive_scores.unsqueeze(1) + negative_scores.unsqueeze(0)
+        losses.append(torch.relu(pairwise_margin).mean())
+    if not losses:
+        return None
+    return torch.stack(losses).mean()
+
+
+def compute_token_presence_metrics(pooled_scores, target_token_ids, excluded_ids, negative_count):
+    top1 = 0
+    top5 = 0
+    top10 = 0
+    total_targets = 0
+    rank_values = []
+    margin_values = []
+
+    for batch_idx, positive_ids in enumerate(target_token_ids):
+        if not positive_ids:
+            continue
+        row = pooled_scores[batch_idx]
+        negative_ids = select_presence_negative_ids(
+            row,
+            positive_ids,
+            negative_count=negative_count,
+            excluded_ids=excluded_ids,
+        )
+        if negative_ids:
+            positive_mean = row[positive_ids].mean().item()
+            negative_mean = row[negative_ids].mean().item()
+            margin_values.append(positive_mean - negative_mean)
+
+        allowed_scores = row.clone()
+        if excluded_ids:
+            allowed_scores[list(excluded_ids)] = float('-inf')
+
+        for token_id in positive_ids:
+            total_targets += 1
+            token_score = allowed_scores[token_id]
+            rank = int((allowed_scores > token_score).sum().item()) + 1
+            rank_values.append(rank)
+            if rank == 1:
+                top1 += 1
+            if rank <= 5:
+                top5 += 1
+            if rank <= 10:
+                top10 += 1
+
+    if total_targets == 0:
+        return {
+            'target_count': 0,
+            'top1_count': 0,
+            'top5_count': 0,
+            'top10_count': 0,
+            'top1_ratio': 0.0,
+            'top5_ratio': 0.0,
+            'top10_ratio': 0.0,
+            'mean_rank': 0.0,
+            'median_rank': 0.0,
+            'mean_margin': 0.0,
+            'rank_sum': 0.0,
+            'margin_sum': 0.0,
+            'margin_count': 0,
+        }
+
+    rank_array = np.array(rank_values, dtype=np.float32)
+    return {
+        'target_count': total_targets,
+        'top1_count': top1,
+        'top5_count': top5,
+        'top10_count': top10,
+        'top1_ratio': top1 / total_targets,
+        'top5_ratio': top5 / total_targets,
+        'top10_ratio': top10 / total_targets,
+        'mean_rank': float(rank_array.mean()),
+        'median_rank': float(np.median(rank_array)),
+        'mean_margin': float(np.mean(margin_values)) if margin_values else 0.0,
+        'rank_sum': float(rank_array.sum()),
+        'margin_sum': float(np.sum(margin_values)) if margin_values else 0.0,
+        'margin_count': len(margin_values),
+    }
+
+
+def merge_token_presence_metrics(running, batch_metrics):
+    running['target_count'] += batch_metrics['target_count']
+    running['top1_count'] += batch_metrics['top1_count']
+    running['top5_count'] += batch_metrics['top5_count']
+    running['top10_count'] += batch_metrics['top10_count']
+    running['rank_sum'] += batch_metrics['rank_sum']
+    running['margin_sum'] += batch_metrics['margin_sum']
+    running['margin_count'] += batch_metrics['margin_count']
+
+
+def finalize_token_presence_metrics(running):
+    target_count = running['target_count']
+    margin_count = running['margin_count']
+    return {
+        'target_count': target_count,
+        'top1_count': running['top1_count'],
+        'top5_count': running['top5_count'],
+        'top10_count': running['top10_count'],
+        'top1_ratio': (running['top1_count'] / target_count) if target_count else 0.0,
+        'top5_ratio': (running['top5_count'] / target_count) if target_count else 0.0,
+        'top10_ratio': (running['top10_count'] / target_count) if target_count else 0.0,
+        'mean_rank': (running['rank_sum'] / target_count) if target_count else 0.0,
+        'mean_margin': (running['margin_sum'] / margin_count) if margin_count else 0.0,
+    }
+
+
+def empty_token_presence_metrics():
+    return {
+        'target_count': 0,
+        'top1_count': 0,
+        'top5_count': 0,
+        'top10_count': 0,
+        'rank_sum': 0.0,
+        'margin_sum': 0.0,
+        'margin_count': 0,
+    }
 
 # parser helper for optional probabilities in [0, 1]
 def optional_probability(value):
@@ -601,6 +809,14 @@ parser.add_argument('--pose_root', type=str, default=None,
                     help='Optional root containing prepared pose sidecars under pose_landmarks/<split>/<sample_id>/1/.')
 parser.add_argument('--pose_fusion_mode', type=str, default='off', choices=['off', 'add'],
                     help='Optional pose sidecar fusion mode. off keeps the RGB baseline unchanged.')
+parser.add_argument('--token_presence_rank_weight', type=float, default=0.0,
+                    help='Weight for optional token-presence ranking loss over pooled vocabulary evidence. Default 0 keeps baseline behavior.')
+parser.add_argument('--token_presence_negative_count', type=int, default=32,
+                    help='Number of hardest non-target tokens to compare against per sample for token presence ranking.')
+parser.add_argument('--token_presence_pool', type=str, default='logsumexp', choices=['max', 'logsumexp'],
+                    help='Pooling mode over time for token presence evidence.')
+parser.add_argument('--token_presence_margin', type=float, default=0.2,
+                    help='Margin used by the token presence ranking loss.')
 
 
 #----------------------------------------------------------------------------------------
@@ -652,6 +868,21 @@ if args.pose_fusion_mode != 'off' and not args.pose_root:
 
 if args.pose_fusion_mode != 'off' and args.hand_query:
     parser.error('--pose_fusion_mode is not supported with --hand_query in the first pose branch.')
+
+if args.token_presence_rank_weight < 0.0:
+    parser.error('--token_presence_rank_weight must be non-negative.')
+
+if args.token_presence_negative_count < 1:
+    parser.error('--token_presence_negative_count must be at least 1.')
+
+if args.token_presence_margin < 0.0:
+    parser.error('--token_presence_margin must be non-negative.')
+
+if args.token_presence_rank_weight > 0.0:
+    if args.hand_query:
+        parser.error('--token_presence_rank_weight is not supported with --hand_query in the first token presence branch.')
+    if args.distributed:
+        parser.error('--token_presence_rank_weight is not supported with --distributed in the first token presence branch.')
 
 #Set the random seed manually for reproducibility.
 torch.manual_seed(args.seed)
@@ -725,6 +956,9 @@ def run_epoch(model, data, is_train=False, device=None, n_devices=1):
     tokens = 0
     total_wer_score = 0.0
     count = 0
+    token_presence_running = empty_token_presence_metrics()
+    token_presence_loss_total = 0.0
+    token_presence_loss_count = 0
 
     gt = []
     hyp = []
@@ -928,6 +1162,34 @@ def run_epoch(model, data, is_train=False, device=None, n_devices=1):
         #IMPORTANT: Use Pytorch CTCloss
         #print(output.shape)
         #print(y.shape)
+        token_presence_loss = None
+        if args.token_presence_rank_weight > 0.0:
+            pooled_scores = pool_token_presence_scores(
+                output_context,
+                effective_lengths,
+                pool_mode=args.token_presence_pool,
+            )
+            target_token_ids = collect_target_token_ids(
+                y,
+                y_lengths,
+                excluded_ids={pad_index, blank_index},
+            )
+            batch_presence_metrics = compute_token_presence_metrics(
+                pooled_scores,
+                target_token_ids,
+                excluded_ids={pad_index, blank_index},
+                negative_count=args.token_presence_negative_count,
+            )
+            merge_token_presence_metrics(token_presence_running, batch_presence_metrics)
+
+            token_presence_loss = compute_token_presence_rank_loss(
+                pooled_scores,
+                target_token_ids,
+                excluded_ids={pad_index, blank_index},
+                negative_count=args.token_presence_negative_count,
+                margin=args.token_presence_margin,
+            )
+
         if output_cr is not None:
             ctc_loss_a = ctc_loss(output, y.cpu(), x_lengths.cpu(), y_lengths.cpu())
             ctc_loss_b = ctc_loss(output_cr, y.cpu(), x_lengths.cpu(), y_lengths.cpu())
@@ -943,6 +1205,11 @@ def run_epoch(model, data, is_train=False, device=None, n_devices=1):
         if output_visual_ctc is not None:
             visual_ctc_loss = ctc_loss(output_visual_ctc, y.cpu(), x_lengths.cpu(), y_lengths.cpu())
             loss = loss + args.visual_ctc_weight * visual_ctc_loss
+
+        if token_presence_loss is not None and torch.isfinite(token_presence_loss):
+            loss = loss + args.token_presence_rank_weight * token_presence_loss
+            token_presence_loss_total += token_presence_loss.detach().item()
+            token_presence_loss_count += 1
 
         if(args.hand_query):
             loss += ctc_loss(output_context, y.cpu(), x_lengths.cpu(), y_lengths.cpu())
@@ -1009,6 +1276,19 @@ def run_epoch(model, data, is_train=False, device=None, n_devices=1):
                 telemetry = format_device_telemetry(telemetry_poller.sample())
                 print("Step: %d, Loss: %f, Frame per Sec: %f, Token per sec: %f"%
                       (step, (loss.detach() / batch_tokens), total_seqs * batch_size / elapsed, tokens / elapsed))
+                if args.token_presence_rank_weight > 0.0:
+                    live_presence = finalize_token_presence_metrics(token_presence_running)
+                    print(
+                        "Token presence: avg_loss=%.6f, top5=%d/%d, top10=%d/%d, mean_rank=%.2f, mean_margin=%.4f" % (
+                            (token_presence_loss_total / token_presence_loss_count) if token_presence_loss_count else 0.0,
+                            live_presence['top5_count'],
+                            live_presence['target_count'],
+                            live_presence['top10_count'],
+                            live_presence['target_count'],
+                            live_presence['mean_rank'],
+                            live_presence['mean_margin'],
+                        )
+                    )
                 if args.anchor_ce_weight > 0.0:
                     if last_anchor_ce is None:
                         print("Anchor CE: skipped, Anchors: 0")
@@ -1027,7 +1307,7 @@ def run_epoch(model, data, is_train=False, device=None, n_devices=1):
 
         #Free some memory
         #NOTE: this helps alot in avoiding cuda out of memory
-        del loss, output, output_context, output_hand, output_interctc, output_visual_ctc, output_context_cr, output_cr, y, hand_regions, pose_landmarks, batch
+        del loss, output, output_context, output_hand, output_interctc, output_visual_ctc, output_context_cr, output_cr, token_presence_loss, y, hand_regions, pose_landmarks, batch
 
     if bar is not None:
         bar.finish()
@@ -1037,14 +1317,14 @@ def run_epoch(model, data, is_train=False, device=None, n_devices=1):
 
     if(is_train):
         print("Average Loss: %f" %(total_loss.item() / total_tokens.item()))
-        return total_loss.item() / total_tokens.item()
+        return total_loss.item() / total_tokens.item(), finalize_token_presence_metrics(token_presence_running), ((token_presence_loss_total / token_presence_loss_count) if token_presence_loss_count else 0.0)
 
     else:
         #Measure WER of all dataset
         print('Measuring WER..')
         print("Average WER: %f" %(total_wer_score/count))
 
-        return total_loss.item() / total_tokens.item(), total_wer_score/count
+        return total_loss.item() / total_tokens.item(), total_wer_score/count, finalize_token_presence_metrics(token_presence_running), ((token_presence_loss_total / token_presence_loss_count) if token_presence_loss_count else 0.0)
 #-------------------------------------------------------------------------------------------------------
 
 ### LOAD DATALOADERS
@@ -1157,6 +1437,20 @@ vocab = {y:x for x,y in word_to_id.items()}
 
 #You should find
 print('vocabulary size:' + str(vocab_size))
+
+token_presence_dev_target_count = 0
+if args.token_presence_rank_weight > 0.0:
+    valid_token_rows = load_corpus_rows(valid_path[1])
+    excluded_token_ids = {pad_index, blank_index}
+    valid_target_token_ids = set()
+    for row in valid_token_rows:
+        for token in row['tokens']:
+            token_id = word_to_id.get(token)
+            if token_id is None or token_id in excluded_token_ids:
+                continue
+            valid_target_token_ids.add(token_id)
+    token_presence_dev_target_count = len(valid_target_token_ids)
+    print('token presence dev target count:' + str(token_presence_dev_target_count))
 
 #-----------------------------------------------------------------------------------------------------------------
 
@@ -1297,7 +1591,7 @@ for epoch in range(start_epoch, num_epochs):
     #print('LR',scheduler.get_lr())
     print(current_learning_rate(optimizer))
     # RUN MODEL ON TRAINING DATA
-    train_loss = run_epoch(model, train_dataloader, True, device=device)
+    train_loss, train_presence_metrics, train_presence_loss = run_epoch(model, train_dataloader, True, device=device)
     print("After train epoch..")
     print_device_utilization(device)
 
@@ -1316,7 +1610,7 @@ for epoch in range(start_epoch, num_epochs):
         #RUN MODEL ON VALIDATION DATA
         #NOTE: Helps with avoiding memory saturation
         with torch.no_grad():
-            val_loss, word_err = run_epoch(model, valid_dataloader, device=device)
+            val_loss, word_err, valid_presence_metrics, valid_presence_loss = run_epoch(model, valid_dataloader, device=device)
 
             if word_err < best_err_so_far:
                 best_err_so_far = word_err
@@ -1371,6 +1665,23 @@ for epoch in range(start_epoch, num_epochs):
             'valid/best_wer': float(best_err_so_far),
             'time/epoch_seconds': float(times[-1]),
         }
+        if args.token_presence_rank_weight > 0.0:
+            epoch_metrics.update({
+                'train/token_presence_loss': float(train_presence_loss),
+                'train/token_presence_top1': float(train_presence_metrics['top1_ratio']),
+                'train/token_presence_top5': float(train_presence_metrics['top5_ratio']),
+                'train/token_presence_top10': float(train_presence_metrics['top10_ratio']),
+                'train/token_presence_mean_rank': float(train_presence_metrics['mean_rank']),
+                'train/token_presence_mean_margin': float(train_presence_metrics['mean_margin']),
+                'train/token_presence_target_count': int(train_presence_metrics['target_count']),
+                'valid/token_presence_loss': float(valid_presence_loss),
+                'valid/token_presence_top1': float(valid_presence_metrics['top1_ratio']),
+                'valid/token_presence_top5': float(valid_presence_metrics['top5_ratio']),
+                'valid/token_presence_top10': float(valid_presence_metrics['top10_ratio']),
+                'valid/token_presence_mean_rank': float(valid_presence_metrics['mean_rank']),
+                'valid/token_presence_mean_margin': float(valid_presence_metrics['mean_margin']),
+                'valid/token_presence_target_count': int(valid_presence_metrics['target_count']),
+            })
         log_wandb(wandb_run, epoch_metrics)
         if offline_registry is not None:
             try:
@@ -1380,6 +1691,20 @@ for epoch in range(start_epoch, num_epochs):
 
         with open (os.path.join(args.save_dir, 'log.txt'), 'a') as f_:
                 f_.write(log_str+ '\n')
+                if args.token_presence_rank_weight > 0.0:
+                    f_.write(
+                        'token presence:\t'
+                        + 'train loss: ' + str(train_presence_loss) + '\t'
+                        + 'train top5: ' + str(train_presence_metrics['top5_count']) + '/' + str(train_presence_metrics['target_count']) + '\t'
+                        + 'train top10: ' + str(train_presence_metrics['top10_count']) + '/' + str(train_presence_metrics['target_count']) + '\t'
+                        + 'train mean rank: ' + str(train_presence_metrics['mean_rank']) + '\t'
+                        + 'train mean margin: ' + str(train_presence_metrics['mean_margin']) + '\t'
+                        + 'valid loss: ' + str(valid_presence_loss) + '\t'
+                        + 'valid top5: ' + str(valid_presence_metrics['top5_count']) + '/' + str(valid_presence_metrics['target_count']) + '\t'
+                        + 'valid top10: ' + str(valid_presence_metrics['top10_count']) + '/' + str(valid_presence_metrics['target_count']) + '\t'
+                        + 'valid mean rank: ' + str(valid_presence_metrics['mean_rank']) + '\t'
+                        + 'valid mean margin: ' + str(valid_presence_metrics['mean_margin']) + '\n'
+                    )
 
 
         #SAVE LEARNING CURVES
