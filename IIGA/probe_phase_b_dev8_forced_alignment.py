@@ -18,9 +18,6 @@ from tools.utils import Batch, path_data
 from transformer import make_model as TRANSFORMER
 
 
-DEV_IDS = ['600', '1174', '706', '1224', '199', '1030', '1319', '1341']
-
-
 def read_corpus_rows(csv_path: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     with csv_path.open('r', encoding='utf-8') as handle:
@@ -221,9 +218,7 @@ def main() -> None:
     args = parser.parse_args()
 
     prepared_root = Path(args.prepared_root)
-    dev_rows = read_corpus_rows(prepared_root / 'annotations' / 'manual' / 'dev.corpus.csv')
-    dev_by_id = {row['sample_id']: row for row in dev_rows}
-    rows = [dev_by_id[sample_id] for sample_id in DEV_IDS]
+    rows = read_corpus_rows(prepared_root / 'annotations' / 'manual' / 'dev.corpus.csv')
 
     with open(args.lookup_table, 'rb') as handle:
         lookup = pickle.load(handle)
