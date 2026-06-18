@@ -1102,7 +1102,16 @@ class FullTransformer(nn.Module):
             rel_mask = src_mask
 
         #Get context seq emb
-        src_emb, f_map, grad = self.src_emb(src, src_mask)
+        #In replace mode the CNN feature extractor is bypassed entirely;
+        #pose landmarks are projected straight into the encoder stream.
+        if self.pose_fusion_mode == 'replace':
+            if pose_landmarks is None:
+                raise RuntimeError('pose_fusion_mode=replace requires pose_landmarks at forward time')
+            src_emb = self.pose_sidecar_projector(pose_landmarks)
+            f_map = None
+            grad = None
+        else:
+            src_emb, f_map, grad = self.src_emb(src, src_mask)
 
         if src_mask is not None and src_mask.shape[-1] != src_emb.size(1):
             src_mask = F.interpolate(src_mask.to(src_emb.dtype), size=src_emb.size(1), mode='nearest').bool()
@@ -1112,10 +1121,11 @@ class FullTransformer(nn.Module):
         #print(src_emb.size())
 
         #register the hook
-        if(f_map.requires_grad):
-            f_map.register_hook(self.activations_hook)
+        if f_map is not None:
+            if(f_map.requires_grad):
+                f_map.register_hook(self.activations_hook)
 
-        self.activations = f_map
+            self.activations = f_map
         
         if src_emb.size()[1] % self.window_size !=0:
             n = src_emb.size()[1] // self.window_size
@@ -1274,6 +1284,26 @@ class ConformerEncoderLayer(nn.Module):
         return self.final_norm(x)
 
 
+#Lightweight stand-in for src_emb used only in pose_fusion_mode='replace'.
+#The CNN feature extractor is bypassed entirely in that mode, so we avoid
+#constructing (and downloading ImageNet weights for) an unused backbone.
+#The stub only carries the attributes the rest of the code reads off src_emb:
+#temporal_reduction (consumed by effective_ctc_lengths in train.py).
+class _PoseOnlySrcEmbStub(nn.Module):
+    def __init__(self, n_units):
+        super(_PoseOnlySrcEmbStub, self).__init__()
+        self.n_units = n_units
+        self.temporal_reduction = 1
+        self.cnn_output_units = None
+        self.videomae_clip_frames = None
+        self.videomae_tubelet_size = None
+        self.videomae_spatial_grid = None
+        self.gradients = None
+
+    def forward(self, x, src_mask=None):
+        raise RuntimeError('_PoseOnlySrcEmbStub.forward must not be called; pose_fusion_mode=replace bypasses the CNN')
+
+
 def make_model(tgt_vocab, n_stacks=2, n_units=512, n_heads=10, window_size=10 , d_ff=2048, dropout=0.3, image_size=224, pretrained=True, emb_type='2d', emb_network='mb2', full_pretrained=None, hand_pretrained=None, freeze_cnn=False, channels=3, encoder_type='legacy', conformer_kernel_size=17, segment_attention_mode='on', log_segment_stats=False, pose_fusion_mode='off'):
 
     c = copy.deepcopy
@@ -1286,67 +1316,44 @@ def make_model(tgt_vocab, n_stacks=2, n_units=512, n_heads=10, window_size=10 , 
     if segment_attention_mode not in {'on', 'off'}:
         raise ValueError(f'Unknown segment_attention_mode: {segment_attention_mode}')
 
-    if pose_fusion_mode not in {'off', 'add'}:
+    if pose_fusion_mode not in {'off', 'add', 'replace'}:
         raise ValueError(f'Unknown pose_fusion_mode: {pose_fusion_mode}')
 
-    if encoder_type == 'legacy':
-        encoder = Encoder(
-            EncoderStack(
-                n_units,
-                c(attn),
-                c(ff),
-                c(seg_att),
-                dropout,
-                window_size,
-                segment_attention_mode=segment_attention_mode,
-                log_segment_stats=log_segment_stats,
-            ),
-            2,
-        )
-    elif encoder_type == 'iiga':
-        encoder = Encoder(
-            EncoderStack(
-                n_units,
-                c(attn),
-                c(ff),
-                c(seg_att),
-                dropout,
-                window_size,
-                segment_attention_mode='on',
-                log_segment_stats=log_segment_stats,
-            ),
-            n_stacks,
-        )
-    elif encoder_type == 'conformer':
-        encoder = Encoder(ConformerEncoderLayer(n_units, n_heads, d_ff, dropout, conformer_kernel_size), n_stacks)
+    #In replace mode the CNN feature extractor is never used; pose landmarks are
+    #projected straight into the encoder. Avoid constructing (and downloading
+    #ImageNet weights for) an unused backbone by passing a lightweight stub that
+    #only carries the attributes the rest of the code reads off src_emb.
+    if pose_fusion_mode == 'replace':
+        src_emb = _PoseOnlySrcEmbStub(n_units)
     else:
-        raise ValueError(f'Unknown encoder_type: {encoder_type}')
+        src_emb = src_2Dembeddings(n_units, pretrained, image_size, network_type=emb_network, channels=channels)
 
     model = FullTransformer(window_size,
         encoder,
-        src_2Dembeddings(n_units, pretrained, image_size, network_type=emb_network, channels=channels),
+        src_emb,
         Output_layer(n_units, tgt_vocab),
         c(position),
         pose_fusion_mode=pose_fusion_mode
         )
 
-    #Load pretrained CNNs (trained on same dataset)
-    if(full_pretrained):
+    #Load pretrained CNNs (trained on same dataset); skipped in replace mode.
+    if(full_pretrained and pose_fusion_mode != 'replace'):
         model.src_emb.load_state_dict(torch.load(full_pretrained))
         print("Full frame CNN pretrained weights successfully loaded..")
 
-    if(hand_pretrained):
+    if(hand_pretrained and pose_fusion_mode != 'replace'):
         model.hand_emb.load_state_dict(torch.load(hand_pretrained))
         print("Hand CNN pretrained weights succesfully loaded..")
 
     #Initialize parameters with Glorot/xavier. (except image/hand embeddings that are init by imagenet weights)
+    #In replace mode there is no src_emb/hand_emb CNN to preserve.
     for name, p in model.named_parameters():
 
-        if(freeze_cnn and ('src_emb' in name or 'hand_emb' in name)):
+        if(freeze_cnn and ('src_emb' in name or 'hand_emb' in name) and pose_fusion_mode != 'replace'):
             p.requires_grad = False
 
         #Fan in/out can't compute with dim > 1
-        if p.dim() > 1 and 'src_emb' not in name and 'hand_emb' not in name:
+        if p.dim() > 1 and (('src_emb' not in name and 'hand_emb' not in name) or pose_fusion_mode == 'replace'):
             nn.init.xavier_uniform_(p)
 
     return model

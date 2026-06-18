@@ -870,7 +870,7 @@ parser.add_argument('--anchor_debug_sample_ids', type=str, default=None,
 
 parser.add_argument('--pose_root', type=str, default=None,
                     help='Optional root containing prepared pose sidecars under pose_landmarks/<split>/<sample_id>/1/.')
-parser.add_argument('--pose_fusion_mode', type=str, default='off', choices=['off', 'add'],
+parser.add_argument('--pose_fusion_mode', type=str, default='off', choices=['off', 'add', 'replace'],
                     help='Optional pose sidecar fusion mode. off keeps the RGB baseline unchanged.')
 parser.add_argument('--token_presence_rank_weight', type=float, default=0.0,
                     help='Weight for optional token-presence ranking loss over pooled vocabulary evidence. Default 0 keeps baseline behavior.')

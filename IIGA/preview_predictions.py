@@ -141,7 +141,7 @@ if __name__ == '__main__':
     parser.add_argument('--log_segment_stats', action='store_true')
     parser.add_argument('--pose_root', type=str, default=None,
                         help='Optional root containing prepared pose sidecars under pose_landmarks/<split>/<sample_id>/1/.')
-    parser.add_argument('--pose_fusion_mode', type=str, default='off', choices=['off', 'add'],
+    parser.add_argument('--pose_fusion_mode', type=str, default='off', choices=['off', 'add', 'replace'],
                         help='Optional pose sidecar fusion mode. off keeps the RGB baseline unchanged.')
     parser.add_argument('--image_type', type=str, default='rgb', choices=['rgb', 'grayscale'])
     parser.add_argument('--local_window', type=int, default=10)
