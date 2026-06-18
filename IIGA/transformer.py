@@ -1319,6 +1319,39 @@ def make_model(tgt_vocab, n_stacks=2, n_units=512, n_heads=10, window_size=10 , 
     if pose_fusion_mode not in {'off', 'add', 'replace'}:
         raise ValueError(f'Unknown pose_fusion_mode: {pose_fusion_mode}')
 
+    if encoder_type == 'legacy':
+        encoder = Encoder(
+            EncoderStack(
+                n_units,
+                c(attn),
+                c(ff),
+                c(seg_att),
+                dropout,
+                window_size,
+                segment_attention_mode=segment_attention_mode,
+                log_segment_stats=log_segment_stats,
+            ),
+            2,
+        )
+    elif encoder_type == 'iiga':
+        encoder = Encoder(
+            EncoderStack(
+                n_units,
+                c(attn),
+                c(ff),
+                c(seg_att),
+                dropout,
+                window_size,
+                segment_attention_mode='on',
+                log_segment_stats=log_segment_stats,
+            ),
+            n_stacks,
+        )
+    elif encoder_type == 'conformer':
+        encoder = Encoder(ConformerEncoderLayer(n_units, n_heads, d_ff, dropout, conformer_kernel_size), n_stacks)
+    else:
+        raise ValueError(f'Unknown encoder_type: {encoder_type}')
+
     #In replace mode the CNN feature extractor is never used; pose landmarks are
     #projected straight into the encoder. Avoid constructing (and downloading
     #ImageNet weights for) an unused backbone by passing a lightweight stub that
